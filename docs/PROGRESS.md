@@ -515,7 +515,7 @@ files = [transcript.srt, transcript.md, article.md]
 | R2-06 10% 覆盖率即算完整 | ✅ 已修复 | 区分 `has_ocr_evidence` 与 `is_transcript_complete`：新增轻量**能量法 VAD**（`audio_vad.py`，100ms 帧 RMS）估计有声时段，再算字幕对**有声时段**的覆盖率与最长缺口；没有语音活动证据时保守返回 `unknown`，不冒充完整。`source=ocr` 仍不跑 ASR（硬约束），`auto` 按证据回退；manifest 写明状态/依据/指标 | T14/T15/T16/T21/T22 |
 | R2-07 只用 best 的全片 ROI | ✅ 已修复 | 引入 `RoiPlan`/`RoiSlot`：**按时间选用** ROI；主字幕区 + 时间重叠的第二字幕行（双语）→ 同一时段两个 ROI，两行都能识别；时间不重叠的其它区域（片中位置变化）→ 独立时段。区域外包络横向用 min/max（长句两端不被裁断）、纵向用 p02/p98。`visual_text` 排除**所有**已确认字幕区域，第二行不会落进界面通道 | T17/T18/T19/T20/T24/T25/T26/T27/T28 |
 
-**Phase B 提交**：`__PHASE_B_SHA__`（已推送）。
+**Phase B 提交**：`4e7c8c1`（已推送）。
 
 ### 本轮实测踩坑（Phase A/B 修掉的真 bug）
 
