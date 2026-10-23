@@ -83,9 +83,12 @@ class Harness(Pipeline):
             return [], ["模拟抽帧失败"]
         assets = out_dir / "assets"
         assets.mkdir(parents=True, exist_ok=True)
+        suffix = {"jpg": "jpg", "jpeg": "jpg", "webp": "webp", "png": "png"}.get(
+            (self.cfg.image_format or "jpg").lower(), "jpg"
+        )
         frames = []
         for i in range(self.behaviour.get("frame_count", 2)):
-            p = assets / f"frame_{i:03d}.jpg"
+            p = assets / f"frame_{i:03d}.{suffix}"
             p.write_bytes(b"fake-jpeg-bytes")
             frames.append(Frame(time_ms=i * 1000, relative_path=f"assets/{p.name}",
                                reason="scene_change"))

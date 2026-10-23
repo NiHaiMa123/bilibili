@@ -266,4 +266,7 @@ def test_merge_ocr_asr_fills_gaps_and_keeps_sources():
     assert any(s.start_ms == 20000 for s in merged)
     # 重叠且文本差异大 → 记冲突
     assert conflicts
-    assert conflicts[0]["note"]
+    assert conflicts[0]["reason"]
+    assert conflicts[0]["ocr_text"] and conflicts[0]["asr_text"]
+    assert conflicts[0]["ocr_source"] == "hard_subtitle_ocr"
+    assert conflicts[0]["asr_source"] == "qwen3_asr"

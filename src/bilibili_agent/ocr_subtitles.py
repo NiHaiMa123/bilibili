@@ -135,13 +135,30 @@ def is_watermark(text: str) -> bool:
 
 @dataclass(slots=True)
 class Roi:
-    """四维字幕区（相对画面坐标）。"""
+    """四维字幕区（相对画面坐标）。
+
+    坐标顺序固定为 ``(x0, y0, x1, y1)``，构造时一律用**关键字参数**，
+    并在 ``__post_init__`` 里严格校验，避免位置参数写反而静默裁错区域。
+    """
 
     x0: float
     y0: float
     x1: float
     y1: float
     method: str = "auto"
+    heuristic_score: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not (0.0 <= self.x0 < self.x1 <= 1.0):
+            raise ValueError(
+                f"字幕区横向不合法：x0={self.x0}, x1={self.x1}"
+                "（需满足 0 <= x0 < x1 <= 1）"
+            )
+        if not (0.0 <= self.y0 < self.y1 <= 1.0):
+            raise ValueError(
+                f"字幕区纵向不合法：y0={self.y0}, y1={self.y1}"
+                "（需满足 0 <= y0 < y1 <= 1）"
+            )
 
     def as_tuple(self) -> tuple[float, float, float, float]:
         return (self.x0, self.y0, self.x1, self.y1)
@@ -297,7 +314,13 @@ class SubtitleOcr:
     # -- 变化检测（O2） ---------------------------------------------------
     @staticmethod
     def _roi_change(prev, curr) -> float:
-        """ROI 内的归一化像素变化量（0~1）。"""
+        """ROI 内的归一化变化量（0~1）。
+
+        用两个信号取大者：
+        * 灰度均值差 —— 对大面积变化敏感；
+        * "显著变化像素"占比 —— 对**小字出现/消失**敏感（字幕进出画面）。
+        只用均值差会把"字幕刚出现"这种小幅变化吃掉，导致漏句。
+        """
         if prev is None or curr is None:
             return 1.0
         import cv2
@@ -305,10 +328,13 @@ class SubtitleOcr:
 
         a = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY) if prev.ndim == 3 else prev
         b = cv2.cvtColor(curr, cv2.COLOR_BGR2GRAY) if curr.ndim == 3 else curr
-        size = (32, 18)
+        size = (64, 36)
         a = cv2.resize(a, size, interpolation=cv2.INTER_AREA).astype("float32")
         b = cv2.resize(b, size, interpolation=cv2.INTER_AREA).astype("float32")
-        return float(np.abs(a - b).mean() / 255.0)
+        diff = np.abs(a - b)
+        mean = float(diff.mean() / 255.0)
+        ratio = float((diff > 25).mean())
+        return max(mean, ratio)
 
     # -- 主识别 ---------------------------------------------------------
     def observe(
@@ -321,6 +347,12 @@ class SubtitleOcr:
 
         变化触发：ROI 几乎没变就跳过 OCR，沿用上一帧的文本——
         这正好让"同一句字幕持续好几秒"被完整保留。
+
+        状态机（text / blank / error）：
+        * 只有**上一帧确实有字幕**（state=text）且当前画面近似未变，才复用旧文本；
+        * 识别到空白 → 立即清空缓存，**空白之后不能复活旧字幕**；
+        * 引擎异常 / 读帧失败 → 记为 error，既不等于字幕消失，
+          也不无条件沿用旧句（交给合并器按邻近证据判断）。
         """
         frames = self.extract_frames(video, work_dir)
         interval_ms = int(self.config.sample_interval * 1000)
@@ -328,6 +360,7 @@ class SubtitleOcr:
         last_text = ""
         last_score = 0.0
         last_lines = 0
+        state = "init"  # init / text / blank / error
         prev_crop = None
 
         for idx, frame in enumerate(frames):
@@ -339,19 +372,21 @@ class SubtitleOcr:
             except Exception:  # noqa: BLE001
                 image = None
             if image is None:
+                state = "error"
                 observations.append(
                     OcrObservation(time_ms, "", 0.0, error="read_frame_failed")
                 )
                 continue
             crop = self._crop_roi(image, roi)
             if crop is None:
+                state = "error"
                 observations.append(OcrObservation(time_ms, "", 0.0, error="empty_roi"))
                 continue
 
             change = self._roi_change(prev_crop, crop)
             prev_crop = crop
-            if change < self.config.change_threshold and last_text:
-                # 画面没变 → 字幕还在，沿用上一帧文本
+            if state == "text" and change < self.config.change_threshold and last_text:
+                # 画面没变且上一帧确有字幕 → 沿用
                 observations.append(
                     OcrObservation(time_ms, last_text, last_score, lines=last_lines)
                 )
@@ -360,6 +395,7 @@ class SubtitleOcr:
             try:
                 lines = self._ocr_roi(crop, roi, frame_size=(image.shape[0], image.shape[1]))
             except Exception as exc:  # noqa: BLE001
+                state = "error"
                 observations.append(
                     OcrObservation(time_ms, "", 0.0, error=f"ocr_failed:{exc}")
                 )
@@ -367,7 +403,12 @@ class SubtitleOcr:
 
             text, score, nlines = self._lines_to_text(lines)
             if text:
+                state = "text"
                 last_text, last_score, last_lines = text, score, nlines
+            else:
+                # 字幕消失：清空缓存，禁止跨空白复活旧句
+                state = "blank"
+                last_text = ""
             observations.append(OcrObservation(time_ms, text, score, lines=nlines))
 
         return observations
@@ -407,6 +448,13 @@ class SubtitleOcr:
             current_count = 0
 
         for obs in observations:
+            if obs.error:
+                # 引擎异常 / 读帧失败：**不等于字幕消失**，
+                # 不能当成断句点，也不能无条件沿用旧句——保持段落开放，
+                # 交给后续帧的实际识别结果决定。
+                if current_text:
+                    current_end = obs.time_ms + int(self.config.sample_interval * 1000)
+                continue
             text = obs.text.strip()
             if not text:
                 flush()
@@ -470,10 +518,26 @@ class SubtitleOcr:
         detection = tracker.track(video)
         best = detection.best
         if best is not None:
-            return Roi(best.x0, best.y0, best.x1, best.y1, method="temporal_tracking_v1")
+            return Roi(
+                x0=best.x0, y0=best.y0, x1=best.x1, y1=best.y1,
+                method="temporal_tracking_v1",
+                heuristic_score=best.heuristic_score,
+            )
+        return self._fallback_roi()
+
+    def _fallback_roi(self) -> Roi:
+        """回退 ROI：**全宽**的底部字幕区。
+
+        注意：Roi 的参数顺序是 (x0, y0, x1, y1)，
+        曾经在这里写成位置参数导致横纵颠倒，只裁到右下角一小块。
+        """
         return Roi(
-            self.config.band_top, self.config.band_top + 0.2,
-            1.0, self.config.band_bottom, method="fallback",
+            x0=0.0,
+            y0=self.config.band_top,
+            x1=1.0,
+            y1=self.config.band_bottom,
+            method="fallback",
+            heuristic_score=0.0,
         )
 
     def detect_roi(
@@ -489,7 +553,10 @@ class SubtitleOcr:
         if fixed is not None:
             y0, y1 = fixed
             return (
-                Roi(0.0, y0, 1.0, y1, method="fixed"),
+                Roi(
+                    x0=0.0, y0=y0, x1=1.0, y1=y1,
+                    method="fixed", heuristic_score=1.0,
+                ),
                 {"method": "fixed", "regions": [], "warnings": []},
                 None,
             )
@@ -507,16 +574,23 @@ class SubtitleOcr:
         info = detection.to_dict()
         best = detection.best
         if best is None:
-            roi = Roi(
-                self.config.band_top, self.config.band_top + 0.2,
-                1.0, self.config.band_bottom, method="fallback",
-            )
+            roi = self._fallback_roi()
             info.setdefault("warnings", []).append(
-                "字幕区跟踪未给出高置信结果，已回退到默认底部区域"
+                "字幕区跟踪未给出高置信结果，已回退到全宽底部区域"
+                f"（{roi.y0:.0%}~{roi.y1:.0%}，method=fallback，heuristic_score=0）"
             )
+            info["fallback"] = True
+            info["roi"] = {
+                "x0": roi.x0, "y0": roi.y0, "x1": roi.x1, "y1": roi.y1,
+                "method": roi.method, "heuristic_score": roi.heuristic_score,
+            }
             return roi, info, detection
         return (
-            Roi(best.x0, best.y0, best.x1, best.y1, method=best.role),
+            Roi(
+                x0=best.x0, y0=best.y0, x1=best.x1, y1=best.y1,
+                method=best.role,
+                heuristic_score=best.heuristic_score,
+            ),
             info,
             detection,
         )

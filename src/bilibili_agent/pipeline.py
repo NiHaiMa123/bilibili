@@ -492,6 +492,25 @@ class Pipeline:
         stats["asr"] = meta
         stats["ocr_asr_conflicts"] = conflicts
         stats["merged_sources"] = sorted({s.source for s in merged})
+        stats["merge_strategy"] = (
+            "ASR 段与 OCR 重叠时按重叠比例处理：完全覆盖且文本一致才去重，"
+            "否则保留 ASR 原文并标记 overlap_with_ocr（不做伪时间切分）"
+        )
+        # 粗粒度整段 ASR 单独留档，避免与 OCR 合并后信息遗失
+        try:
+            alt_path = out_dir / "raw" / "alternate_evidence.json"
+            alt_path.parent.mkdir(parents=True, exist_ok=True)
+            alt_path.write_text(
+                json.dumps({
+                    "asr_segments": [s.to_dict() for s in asr_segments],
+                    "ocr_segments": [s.to_dict() for s in ocr_segments],
+                    "conflicts": conflicts,
+                    "strategy": stats["merge_strategy"],
+                }, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
         return merged, "hard_subtitle_ocr+qwen3_asr", stats, None
 
     def _run_ocr(
@@ -549,46 +568,76 @@ class Pipeline:
     ) -> tuple[list[Segment], list[dict[str, Any]]]:
         """O3-4：OCR 缺口用 ASR 补齐，按时间去重合并。
 
-        * ASR 段落落在 OCR 已覆盖的区间内 → 不重复添加（保留画面原字）；
-        * 落在 OCR 缺口里的 → 追加，**保留自己的 source**；
-        * 同一时间范围内 ASR 与 OCR 文本差异很大 → 记一条冲突证据，
-          不擅自用 ASR 改写画面上的原字（字幕可能是翻译/意译）。
+        关键修正：**不能因为有任意重叠就丢掉整条 ASR**——
+        那会让 30s 块级 ASR 因为 2s 重叠而整段消失。
+
+        规则：
+        * 无重叠 → 原样加入；
+        * **完全被覆盖且文本高度一致** → 去重（保留画面原字）；
+        * 部分重叠 / 文本不一致 → **保留 ASR 原文**并打 ``overlap_with_ocr`` 标记，
+          同时把冲突记进结构化证据。块级 ASR **不做字符比例切分**，
+          避免伪造词级时间戳；两种来源的原始文本都保留。
         """
         from .subtitle_normalize import merged_time_intervals
 
         try:
             from .ocr_subtitles import normalize_text, similarity
         except ImportError:  # pragma: no cover
-            from .subtitle_normalize import similarity  # type: ignore[attr-defined]
+            import re
 
             def normalize_text(text: str) -> str:
-                import re
-
                 return re.sub(r"\s+", "", text or "")
+
+            def similarity(a: str, b: str) -> float:
+                from difflib import SequenceMatcher
+
+                return SequenceMatcher(None, a, b).ratio() if a and b else 0.0
 
         covered = merged_time_intervals(ocr_segments)
         conflicts: list[dict[str, Any]] = []
         merged = list(ocr_segments)
 
         for asr in asr_segments:
-            overlaps = any(
-                asr.start_ms < end and asr.end_ms > start for start, end in covered
-            )
-            if not overlaps:
+            overlap_ms = 0
+            for start, end in covered:
+                overlap_ms += max(0, min(asr.end_ms, end) - max(asr.start_ms, start))
+            duration = max(1, asr.end_ms - asr.start_ms)
+            ratio = overlap_ms / duration
+
+            if ratio <= 0.0:
                 merged.append(asr)
                 continue
+
+            # 有重叠：找出重叠的 OCR 段，比较文本
+            similar = False
             for ocr in ocr_segments:
                 if asr.start_ms < ocr.end_ms and asr.end_ms > ocr.start_ms:
                     a, b = normalize_text(asr.text), normalize_text(ocr.text)
-                    if a and b and a != b and similarity(a, b) < 0.5:
+                    if a and b and a == b:
+                        similar = True
+                    elif a and b and similarity(a, b) >= 0.8:
+                        similar = True
+                    else:
                         conflicts.append({
                             "start_ms": max(asr.start_ms, ocr.start_ms),
                             "end_ms": min(asr.end_ms, ocr.end_ms),
+                            "overlap_ratio": round(ratio, 4),
                             "ocr_text": ocr.text,
                             "asr_text": asr.text,
-                            "note": "OCR 与 ASR 文本不一致，已同时保留原始证据",
+                            "ocr_source": ocr.source,
+                            "asr_source": asr.source,
+                            "reason": "同一时段的画面文字与语音转写不一致"
+                                      "（可能是翻译/意译），双方原文均保留",
                         })
                     break
+
+            if ratio >= 0.95 and similar:
+                # 完全被覆盖且内容一致 → 去重，保留画面原字
+                continue
+
+            # 部分重叠或内容不一致 → 保留 ASR 原文并标记
+            asr.flags = list(asr.flags or []) + ["overlap_with_ocr"]
+            merged.append(asr)
 
         merged.sort(key=lambda s: (s.start_ms, s.end_ms))
         return merged, conflicts
@@ -686,6 +735,48 @@ class Pipeline:
 
     # -- 模式产物要求 ----------------------------------------------------
     @staticmethod
+    def _frames_component_fresh(
+        directory: Path,
+        manifest: dict[str, Any] | None,
+        digest: str,
+        *,
+        need_article: bool,
+    ) -> bool:
+        """帧组件是否可复用。
+
+        必须逐张核对**真实图片文件**存在且非空，并且 frame_count 与清单一致；
+        illustrated/both 还要 article.md 存在。缺任何一张图都要重新抽帧。
+        """
+        if not manifest or manifest.get("status") == "failed":
+            return False
+        comp = get_component(manifest, "frames")
+        if not comp or comp.get("digest") != digest:
+            return False
+        image_files = comp.get("image_files") or []
+        if not image_files:
+            return False
+        if int(comp.get("frame_count") or 0) != len(image_files):
+            return False
+        for rel in image_files:
+            p = Path(directory) / rel
+            if not p.is_file() or p.stat().st_size == 0:
+                return False
+        if need_article:
+            article = comp.get("article_file")
+            if not article:
+                return False
+            p = Path(directory) / article
+            if not p.is_file() or p.stat().st_size == 0:
+                return False
+        return True
+
+    def _image_suffix(self) -> str:
+        """当前配置下的图片后缀（用于缺图提示，不写死 jpg）。"""
+        return {"jpg": "jpg", "jpeg": "jpg", "webp": "webp", "png": "png"}.get(
+            (self.cfg.image_format or "jpg").lower(), "jpg"
+        )
+
+    @staticmethod
     def _required_artifacts(mode: str) -> tuple[list[str], bool]:
         """返回 (必需产物相对路径列表, 是否需要字幕)。
 
@@ -747,10 +838,14 @@ class Pipeline:
         transcript_ok = component_is_fresh(
             out_dir, existing, "transcript", transcript_digest
         )
-        frames_ok = component_is_fresh(out_dir, existing, "frames", frames_digest)
+        frames_ok = self._frames_component_fresh(
+            out_dir, existing, frames_digest,
+            need_article=mode in ("illustrated", "both"),
+        )
 
         def _cached() -> dict[str, Any]:
             manifest = existing or {}
+            frame_comp = get_component(manifest, "frames") or {}
             return {
                 "page": part.page, "cid": part.cid, "ok": True,
                 "status": manifest.get("status", "completed"),
@@ -760,6 +855,10 @@ class Pipeline:
                 ],
                 "subtitle_source": manifest.get("subtitle_source"),
                 "directory": str(out_dir),
+                "image_files": [
+                    str(out_dir / rel)
+                    for rel in (frame_comp.get("image_files") or [])
+                ],
                 "chapters": (manifest.get("extra") or {}).get("chapters") or [],
             }
 
@@ -847,6 +946,15 @@ class Pipeline:
                 # assets 模式没有字幕就没有 article.md，只留图片
                 pass
 
+        # 帧组件以**真实图片清单**为准（不能从 files 反推，
+        # 否则 assets 模式的帧清单会是空的，illustrated 模式会漏掉图片）
+        image_files = [f.relative_path for f in frames]
+        article_file = "article.md" if "article.md" in files else ""
+        # manifest.files / outputs 也要包含图片，语义与 components.frames 一致
+        for rel in image_files:
+            if rel not in files:
+                files.append(rel)
+
         # ---- 按模式校验真实产物 ----
         missing: list[str] = []
         for rel in required:
@@ -854,13 +962,17 @@ class Pipeline:
             if not path.is_file() or path.stat().st_size == 0:
                 missing.append(rel)
         if needs_frames and not frames:
-            missing.append("assets/*.jpg")
+            missing.append(f"assets/*.{self._image_suffix()}")
         if needs_frames:
             for f in frames:
                 p = out_dir / f.relative_path
                 if not p.is_file() or p.stat().st_size == 0:
                     missing.append(f.relative_path)
                     break
+        if needs_frames and article_file:
+            p = out_dir / article_file
+            if not p.is_file() or p.stat().st_size == 0:
+                missing.append(article_file)
 
         if missing:
             status = "failed"
@@ -900,8 +1012,7 @@ class Pipeline:
             settings_digest=digest,
             files=files,
             warnings=list(warnings),
-            coverage=coverage,
-            extra={
+            coverage=coverage,            extra={
                 **({"subtitle_track": track_info} if track_info else {}),
                 **({"asr": extra_meta.get("asr")} if extra_meta and extra_meta.get("asr") else {}),
                 **({"frames": [f.to_dict() for f in frames]} if frames else {}),
@@ -923,10 +1034,10 @@ class Pipeline:
         payload["missing_artifacts"] = sorted(set(missing))
         # 组件级记账：字幕与关键帧分开，改一个不会作废另一个
         transcript_files = [f for f in files if f.startswith("transcript.")]
-        frame_files = [
-            f for f in files
-            if f == "article.md" or f.startswith("assets/")
-        ]
+        # 帧组件登记**真实图片清单**（不是从 files 反推）
+        frame_files = list(image_files)
+        if article_file:
+            frame_files.append(article_file)
         payload["components"] = {
             "transcript": {
                 "digest": transcript_digest,
@@ -941,6 +1052,8 @@ class Pipeline:
                 "digest": frames_digest,
                 "files": frame_files,
                 "frame_count": len(frames),
+                "image_files": list(image_files),
+                "article_file": article_file,
             },
         }
         write_manifest(out_dir / "manifest.json", payload)
@@ -954,6 +1067,7 @@ class Pipeline:
             "outputs": [str(out_dir / name) for name in files],
             "coverage": coverage,
             "frames": len(frames),
+            "image_files": [str(out_dir / rel) for rel in image_files],
             "chapters": [c.to_dict() for c in chapters],
             **({
                 "error": {

@@ -30,6 +30,7 @@ from .ocr_engine import OcrBox, OcrEngine
 # 角色
 ROLE_DIALOGUE = "dialogue_subtitle"
 ROLE_SECONDARY = "secondary_language_subtitle"
+ROLE_TIMELINE = "timeline_subtitle"
 ROLE_ON_SCREEN = "on_screen_text"
 
 
@@ -43,7 +44,10 @@ class TrackerConfig:
     max_width: int = 960  # 整帧 OCR 前的缩放宽度
     max_center_distance: float = 0.06  # 框中心最大可接受间距（相对画面）
     max_height_ratio: float = 1.35  # 字高比例上限（判断是不是同一行）
-    link_gap_ms: int = 1600  # 超过这个间隔就不认为是同一条轨迹
+    link_gap_ms: int = 1600  # 超过这个间隔就不认为是同一条轨迹（L1 窗口内）
+    # L2 跨窗口归并
+    candidate_center_distance: float = 0.10  # 归并两个区域候选的最大行中心距
+    envelope_padding: float = 0.015  # 区域外包络的留白
     min_score: float = 0.35  # 低于此分认为"没把握"，交给调用方 fallback
     static_text_ratio: float = 0.6  # 同一文字占比超过它且持续很久 → 判为界面静态文字
     static_min_duration_ms: int = 20_000  # 持续这么久才算"永久" UI
@@ -144,11 +148,78 @@ class SubtitleRegion:
 
 
 @dataclass(slots=True)
+class RegionCandidate:
+    """L2：跨采样窗口归并出来的**区域候选**。
+
+    只表示"同一位置/同一版式的文字区域在多个窗口里都出现过"，
+    **不表示**字幕文本在没采样的那几分钟里一直存在——
+    因此不能用它虚构覆盖时长。
+    """
+
+    tracks: list[RegionTrack] = field(default_factory=list)
+    rect: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    heuristic_score: float = 0.0
+    evidence: list[str] = field(default_factory=list)
+    role: str = ROLE_DIALOGUE
+
+    @property
+    def windows(self) -> set[int]:
+        out: set[int] = set()
+        for t in self.tracks:
+            out |= t.windows
+        return out
+
+    @property
+    def start_ms(self) -> int:
+        return min((t.start_ms for t in self.tracks), default=0)
+
+    @property
+    def end_ms(self) -> int:
+        return max((t.end_ms for t in self.tracks), default=0)
+
+    def texts(self) -> list[str]:
+        out: list[str] = []
+        for track in self.tracks:
+            for text in track.text_sequence():
+                if text and (not out or out[-1] != text):
+                    out.append(text)
+        return out
+
+    def distinct_texts(self) -> int:
+        return len({t for tr in self.tracks for t in tr.text_sequence()})
+
+    def dominant_text_ratio(self) -> float:
+        """整个候选里，同一文字占全部观测的比例（判断永久 UI 文字）。"""
+        total = sum(len(tr.observations) for tr in self.tracks)
+        if not total:
+            return 0.0
+        counts: dict[str, int] = {}
+        for tr in self.tracks:
+            for _, box in tr.observations:
+                counts[box.text] = counts.get(box.text, 0) + 1
+        return max(counts.values()) / total
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "x0": round(self.rect[0], 4),
+            "y0": round(self.rect[1], 4),
+            "x1": round(self.rect[2], 4),
+            "y1": round(self.rect[3], 4),
+            "start_ms": self.start_ms,
+            "end_ms": self.end_ms,
+            "role": self.role,
+            "heuristic_score": round(self.heuristic_score, 4),
+            "evidence": self.evidence,
+        }
+
+
+@dataclass(slots=True)
 class RegionDetection:
     regions: list[SubtitleRegion] = field(default_factory=list)
     method: str = "temporal_tracking_v1"
     warnings: list[str] = field(default_factory=list)
     tracks: list[RegionTrack] = field(default_factory=list)
+    candidates: list[RegionCandidate] = field(default_factory=list)
     sampled_frames: int = 0
     ocr_calls: int = 0
 
@@ -159,6 +230,7 @@ class RegionDetection:
             "warnings": list(self.warnings),
             "sampled_frames": self.sampled_frames,
             "ocr_calls": self.ocr_calls,
+            "candidates": [c.to_dict() for c in self.candidates],
         }
 
     @property
@@ -296,6 +368,124 @@ class SubtitleRegionTracker:
 
         return max(0.0, min(1.0, score)), evidence
 
+    # -- L2：跨窗口归并 ---------------------------------------------------
+    def _merge_candidates(self, tracks: list[RegionTrack]) -> list[RegionCandidate]:
+        """把窗口内的 L1 轨迹按位置/版式归并成 L2 区域候选。
+
+        窗口之间可能相隔数十秒，L1 的短时关联必然断开；
+        这一层按**归一化行位置、字高、区域外框**把不同窗口里同一处字幕归到一起。
+        """
+        candidates: list[RegionCandidate] = []
+        for track in tracks:
+            x0, y0, x1, y1 = track.rect()
+            cy = (y0 + y1) / 2
+            h = max(y1 - y0, 0.001)
+            placed = False
+            for cand in candidates:
+                rx0, ry0, rx1, ry1 = cand.rect
+                rcy = (ry0 + ry1) / 2
+                rh = max(ry1 - ry0, 0.001)
+                if abs(cy - rcy) > self.config.candidate_center_distance:
+                    continue
+                if h / rh > 1.5 or rh / h > 1.5:
+                    continue
+                cand.tracks.append(track)
+                placed = True
+                break
+            if not placed:
+                candidates.append(RegionCandidate(tracks=[track]))
+        for cand in candidates:
+            cand.rect = self._robust_envelope(cand.tracks)
+        return candidates
+
+    def _robust_envelope(self, tracks: list[RegionTrack]) -> tuple[float, float, float, float]:
+        """稳健外包络：用分位数而不是中位数，避免长短句交替时裁掉长句两端。"""
+        xs0: list[float] = []
+        ys0: list[float] = []
+        xs1: list[float] = []
+        ys1: list[float] = []
+        for track in tracks:
+            for _, box in track.observations:
+                xs0.append(box.x0)
+                ys0.append(box.y0)
+                xs1.append(box.x1)
+                ys1.append(box.y1)
+        if not xs0:
+            return (0.0, 0.0, 0.0, 0.0)
+
+        def pct(values: list[float], q: float) -> float:
+            ordered = sorted(values)
+            idx = min(len(ordered) - 1, max(0, int(q * (len(ordered) - 1))))
+            return ordered[idx]
+
+        pad = self.config.envelope_padding
+        return (
+            max(0.0, pct(xs0, 0.02) - pad),
+            max(0.0, pct(ys0, 0.02) - pad),
+            min(1.0, pct(xs1, 0.98) + pad),
+            min(1.0, pct(ys1, 0.98) + pad),
+        )
+
+    def _score_candidate(self, cand: RegionCandidate) -> tuple[float, list[str]]:
+        """区域候选的可解释打分。"""
+        x0, y0, x1, y1 = cand.rect
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        height = y1 - y0
+        evidence: list[str] = []
+        score = 0.0
+
+        if cy > 0.60:
+            score += 0.12
+            evidence.append("bottom_soft_prior")
+        elif cy > 0.40:
+            score += 0.04
+
+        centered = 1.0 - min(1.0, abs(cx - 0.5) / 0.4)
+        score += 0.15 * centered
+        if centered > 0.6:
+            evidence.append("horizontally_centered")
+
+        score += 0.20 * min(1.0, height / 0.06)
+        if height >= 0.03:
+            evidence.append("large_text")
+
+        # 样式稳定：各成员轨迹字高的一致性
+        heights = [t.height() for t in cand.tracks if t.observations]
+        if len(heights) >= 2:
+            mean = sum(heights) / len(heights)
+            spread = max(heights) - min(heights)
+            stability = 1.0 - min(1.0, spread / mean) if mean > 0 else 0.0
+            score += 0.10 * stability
+            if stability > 0.5:
+                evidence.append("line_style_stable")
+
+        # 内容按句替换（字幕的关键特征）
+        if cand.distinct_texts() >= 2:
+            score += 0.25
+            evidence.append("text_turnover")
+        elif cand.distinct_texts() == 1 and len(cand.tracks) > 1:
+            score -= 0.05
+
+        # 跨窗口持续出现（L2 的核心证据）
+        windows = cand.windows
+        if len(windows) >= 3:
+            score += 0.15
+            evidence.append("persists_across_windows")
+        elif len(windows) == 1 and sum(len(t.observations) for t in cand.tracks) <= 2:
+            score -= 0.12
+            evidence.append("transient_popup")
+
+        # 永久 UI 文字：跨窗口同文本长期不变
+        span = cand.end_ms - cand.start_ms
+        if (
+            cand.dominant_text_ratio() >= self.config.static_text_ratio
+            and span >= self.config.static_min_duration_ms
+        ):
+            score -= 0.35
+            evidence.append("static_ui_text")
+
+        return max(0.0, min(1.0, score)), evidence
+
     # -- 主流程 ----------------------------------------------------------
     def track(self, video: str | Path, duration_ms: int | None = None) -> RegionDetection:
         detection = RegionDetection()
@@ -331,19 +521,25 @@ class SubtitleRegionTracker:
         detection.tracks = tracks
         detection.ocr_calls = self.engine.calls
 
-        scored: list[tuple[float, list[str], RegionTrack]] = []
-        for track in tracks:
-            if len(track.observations) < 2:
+        # L2：跨窗口归并成区域候选（这才让"跨窗口证据"真正生效）
+        candidates = self._merge_candidates(tracks)
+        scored: list[tuple[float, list[str], RegionCandidate]] = []
+        for cand in candidates:
+            total = sum(len(t.observations) for t in cand.tracks)
+            if total < 2:
                 continue
-            score, evidence = self._score(track)
-            scored.append((score, evidence, track))
+            score, evidence = self._score_candidate(cand)
+            cand.heuristic_score = score
+            cand.evidence = evidence
+            scored.append((score, evidence, cand))
         scored.sort(key=lambda x: -x[0])
+        detection.candidates = [c for _, _, c in scored]
 
         if not scored:
             detection.warnings.append("没有追踪到稳定的文字轨迹")
             return detection
 
-        top_score, top_evidence, top_track = scored[0]
+        top_score, top_evidence, top_cand = scored[0]
         if top_score < cfg.min_score:
             detection.warnings.append(
                 f"字幕区启发式得分 {top_score:.2f} 低于阈值 {cfg.min_score:.2f}，"
@@ -351,31 +547,53 @@ class SubtitleRegionTracker:
             )
             return detection
 
-        x0, y0, x1, y1 = top_track.rect()
+        x0, y0, x1, y1 = top_cand.rect
         detection.regions.append(SubtitleRegion(
             x0=x0, y0=y0, x1=x1, y1=y1,
-            start_ms=top_track.start_ms, end_ms=top_track.end_ms,
+            start_ms=top_cand.start_ms, end_ms=top_cand.end_ms,
             role=ROLE_DIALOGUE,
             heuristic_score=top_score,
             evidence=top_evidence,
         ))
 
-        # 第二行（双语）：几何接近但基线不同、且内容也在变
-        for score, evidence, track in scored[1:]:
+        # 第二字幕行（双语）：几何接近但基线不同、且内容也在变
+        for score, evidence, cand in scored[1:]:
             if score < cfg.min_score * 0.8:
                 break
-            tx0, ty0, tx1, ty1 = track.rect()
+            tx0, ty0, tx1, ty1 = cand.rect
             same_column = abs((tx0 + tx1) / 2 - (x0 + x1) / 2) < 0.25
             different_line = abs((ty0 + ty1) / 2 - (y0 + y1) / 2) > 0.04
-            if same_column and different_line:
+            time_overlap = not (
+                cand.end_ms < top_cand.start_ms or cand.start_ms > top_cand.end_ms
+            )
+            if same_column and different_line and time_overlap:
                 detection.regions.append(SubtitleRegion(
                     x0=tx0, y0=ty0, x1=tx1, y1=ty1,
-                    start_ms=track.start_ms, end_ms=track.end_ms,
+                    start_ms=cand.start_ms, end_ms=cand.end_ms,
                     role=ROLE_SECONDARY,
                     heuristic_score=score,
                     evidence=evidence,
                 ))
                 break
+
+        # 位置随时间变化：同一"角色"但时间段不重叠的候选也要单独输出，
+        # 便于下游按时间段选用不同 ROI（而不是强行合成全片一个位置）。
+        for score, evidence, cand in scored[1:]:
+            if score < cfg.min_score * 0.8:
+                break
+            tx0, ty0, tx1, ty1 = cand.rect
+            overlaps = not (
+                cand.end_ms < top_cand.start_ms or cand.start_ms > top_cand.end_ms
+            )
+            if overlaps:
+                continue
+            detection.regions.append(SubtitleRegion(
+                x0=tx0, y0=ty0, x1=tx1, y1=ty1,
+                start_ms=cand.start_ms, end_ms=cand.end_ms,
+                role=ROLE_TIMELINE,
+                heuristic_score=score,
+                evidence=evidence,
+            ))
 
         return detection
 
