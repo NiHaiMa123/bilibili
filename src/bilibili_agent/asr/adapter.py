@@ -57,6 +57,7 @@ class ASRAdapter:
         chunk_seconds: float = 120.0,
         aligner_path: str = "",
         ffmpeg: str = "",
+        language: str = "auto",
         timeout: int = 7200,
     ) -> None:
         self.python = python
@@ -65,6 +66,7 @@ class ASRAdapter:
         self.chunk_seconds = chunk_seconds
         self.aligner_path = aligner_path
         self.ffmpeg = ffmpeg or shutil.which("ffmpeg") or ""
+        self.language = language or "auto"
         self.timeout = timeout
 
     # -- 依赖检查 -------------------------------------------------------
@@ -117,13 +119,24 @@ class ASRAdapter:
         self,
         wav_path: str | Path,
         *,
-        language: str = "Chinese",
+        language: str | None = None,
         out_json: str | Path | None = None,
     ) -> ASRResult:
-        """转写 wav，返回带时间戳的 Segment。"""
+        """转写 wav，返回带时间戳的 Segment。
+
+        ``language`` 为 None/``auto``/``none``（不区分大小写）时表示**自动识别**，
+        底层传的是 Python 的 ``None``；绝对不能把字符串 ``"None"`` 传给模型，
+        qwen_asr 的 ``validate_language`` 会直接抛 ValueError。
+        """
         problems = self.diagnose()
         if problems:
             raise ASRError("；".join(problems))
+
+        lang = language if language is not None else self.language
+        if isinstance(lang, str) and lang.strip().lower() in ("", "auto", "none"):
+            lang_arg: str | None = None
+        else:
+            lang_arg = str(lang)
 
         wav_path = Path(wav_path)
         out_json = Path(out_json) if out_json else wav_path.with_suffix(".asr.json")
@@ -133,7 +146,7 @@ class ASRAdapter:
             "--audio", str(wav_path),
             "--out", str(out_json),
             "--device", self.device,
-            "--language", language,
+            "--language", lang_arg or "auto",
             "--chunk-seconds", str(self.chunk_seconds),
         ]
         if self.aligner_path:

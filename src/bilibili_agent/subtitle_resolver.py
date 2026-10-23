@@ -141,10 +141,17 @@ def list_subtitle_tracks(
 
 
 def fetch_track_body(track: SubtitleTrack, client: BiliClient) -> str:
-    """拉取字幕正文文本。只允许官方 CDN 域名。"""
+    """拉取字幕正文文本。
+
+    只允许官方 CDN 的 https 地址；跳转逐跳校验；**不附带账号 Cookie**。
+    """
     if not is_trusted_subtitle_url(track.url):
         raise BiliApiError(f"拒绝非官方字幕地址：{track.url}")
-    return client.get_text(track.url)
+    return client.get_text(
+        track.url,
+        send_cookie=False,
+        url_validator=is_trusted_subtitle_url,
+    )
 
 
 def choose_track(

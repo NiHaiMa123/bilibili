@@ -116,7 +116,10 @@ def main() -> int:
     ap.add_argument("--audio", required=True, help="输入 wav（16k 单声道）")
     ap.add_argument("--out", required=True, help="输出 JSON 路径")
     ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--language", default="Chinese")
+    ap.add_argument(
+        "--language", default="auto",
+        help="auto=自动识别（传 None 给模型）；也可指定 Chinese/English 等",
+    )
     ap.add_argument("--chunk-seconds", type=float, default=120.0)
     ap.add_argument("--aligner", default="", help="强制对齐模型目录（可选）")
     ap.add_argument("--max-new-tokens", type=int, default=1024)
@@ -146,6 +149,13 @@ def main() -> int:
     duration_s = len(wav) / float(sr) if sr else 0.0
     chunks = split_audio_into_chunks(wav, sr, float(args.chunk_seconds))
 
+    # 语言：auto/none 表示自动识别 → 传 Python None；
+    # 绝不能把字符串 "None" 传给模型（validate_language 会抛 ValueError）。
+    raw_lang = (args.language or "").strip()
+    language: str | None = (
+        None if raw_lang.lower() in ("", "auto", "none") else raw_lang
+    )
+
     aligner_kwargs: dict = {}
     if args.aligner:
         aligner_kwargs["forced_aligner"] = args.aligner
@@ -169,7 +179,7 @@ def main() -> int:
         try:
             result = model.transcribe(
                 audio=(chunk, sr),
-                language=args.language,
+                language=language,
                 return_time_stamps=use_timestamps,
             )[0]
         except Exception as exc:  # noqa: BLE001
@@ -202,7 +212,7 @@ def main() -> int:
         "model": str(args.model),
         "aligner": str(args.aligner) if args.aligner else None,
         "device": device,
-        "language": args.language,
+        "language": language or "auto",
         "audio_duration_s": round(duration_s, 3),
         "chunks": len(chunks),
         "segments": segments,

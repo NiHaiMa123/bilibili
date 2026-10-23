@@ -25,7 +25,7 @@ class FakeClient:
                 return {"data": {"subtitle": {"subtitles": tracks}}}
         return {"data": {}}
 
-    def get_text(self, url, params=None):
+    def get_text(self, url, params=None, **kwargs):
         self.text_calls.append(url)
         return self.bodies.get(url, json.dumps({"body": []}))
 

@@ -59,13 +59,15 @@ def _tool_error(stage: str, message: str, code: int | None = None) -> dict[str, 
     }
 
 
+def _pipeline() -> Pipeline:
+    """构造一个流水线实例（模块级，便于测试替换）。"""
+    return Pipeline(load_config())
+
+
 def _build_server():
     from mcp.server.mcpserver import MCPServer
 
     server = MCPServer(name=SERVER_NAME, instructions=INSTRUCTIONS)
-
-    def _pipeline() -> Pipeline:
-        return Pipeline(load_config())
 
     @server.tool(
         name="bili_search",
@@ -205,6 +207,33 @@ def _build_server():
         if max_images:
             pipe.cfg.max_images = max(1, min(max_images, 200))
         try:
+            if not wait:
+                # 真异步：提交持久本地任务后立刻返回，不在 MCP 调用线程做重计算
+                from .jobs import JobManager, JobSpec
+
+                manager = JobManager(pipe.cfg.temp_path / "jobs")
+                spec = JobSpec(
+                    target=url_or_bvid,
+                    parts=list(parts or []),
+                    mode=mode,
+                    subtitle_source=subtitle_source,
+                    refresh=False,
+                    max_images=pipe.cfg.max_images,
+                    config_path=str(pipe.cfg.config_path) if pipe.cfg.config_path else "",
+                )
+                job = manager.submit(spec)
+                return {
+                    "ok": True,
+                    "status": job.get("state", "queued"),
+                    "job_id": job.get("id"),
+                    "pid": job.get("pid"),
+                    "bvid": None,
+                    "parts": [],
+                    "outputs": [],
+                    "warnings": [],
+                    "read_hint": "用 bili_job_status 查询进度，完成后再用 bili_read_transcript 读取。",
+                }
+
             result = pipe.fetch(
                 url_or_bvid, parts=parts, mode=mode, subtitle_source=subtitle_source
             )
@@ -223,20 +252,30 @@ def _build_server():
     @server.tool(
         name="bili_job_status",
         title="查询任务状态",
-        description="查询一次 materialize 任务的产物与状态。",
+        description="查询一次异步 materialize 任务的产物与状态。",
     )
     def bili_job_status(
         job_id: Annotated[str, Field(description="bili_materialize 返回的 job_id")],
     ) -> dict[str, Any]:
-        pipe = _pipeline()
-        jobs_dir = pipe.cfg.temp_path / "jobs"
-        path = Path(jobs_dir) / f"{job_id}.json"
-        if not path.is_file():
+        from .jobs import JobManager
+
+        cfg = load_config()
+        manager = JobManager(cfg.temp_path / "jobs")
+        job = manager.status(job_id)
+        if job is None:
             return _tool_error("status", f"找不到任务 {job_id}")
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            return _tool_error("status", f"任务记录损坏：{exc}")
+        result = job.get("result") or {}
+        return {
+            "ok": job.get("state") == "completed",
+            "status": job.get("state"),
+            "job_id": job_id,
+            "stage": job.get("stage"),
+            "outputs": job.get("outputs") or [],
+            "error": job.get("error"),
+            "bvid": result.get("bvid"),
+            "chapters": _chapter_index(result.get("parts") or []),
+            "warnings": result.get("warnings") or [],
+        }
 
     @server.tool(
         name="bili_read_transcript",

@@ -75,3 +75,48 @@ def test_config_suffix_mapping():
     assert FrameSelectorConfig(image_format="jpeg").suffix == "jpg"
     assert FrameSelectorConfig(image_format="png").suffix == "png"
     assert FrameSelectorConfig(image_format="webp").suffix == "webp"
+
+
+# ---------------------------------------------------------------- T17 时间分桶
+def test_late_segment_still_gets_frames():
+    """前段 100 个场景变化 + 后段 2 个关键操作 → 后段仍要有图。"""
+    cfg = FrameSelectorConfig(max_images=8, min_gap_seconds=1.0)
+    sel = FrameSelector(config=cfg)
+    # 前 25% 时间里有 100 个场景变化，后 75% 只有 2 个
+    scene_changes = [(i * 100, 0.9) for i in range(100)]
+    segments = [
+        Segment(start_ms=800_000, end_ms=801_000, text="后段关键操作一"),
+        Segment(start_ms=900_000, end_ms=901_000, text="后段关键操作二"),
+    ]
+    cands = sel.build_candidates(scene_changes, segments)
+    kept = sel.thin(cands)
+    assert kept
+    assert len(kept) <= cfg.max_images
+    late = [c for c in kept if c.time_ms >= 700_000]
+    assert late, "后段必须保留至少一张关键帧"
+    # 后段的字幕锚点应当被选中
+    assert any(800_000 <= c.time_ms <= 901_000 for c in kept)
+
+
+def test_frames_cover_whole_timeline():
+    """选出的帧应分布在整条时间轴上，而不是挤在开头。"""
+    cfg = FrameSelectorConfig(max_images=6, min_gap_seconds=0.5)
+    sel = FrameSelector(config=cfg)
+    scene_changes = [(i * 100, 0.9) for i in range(100)]  # 前 10 秒
+    segments = [
+        Segment(start_ms=i * 60_000, end_ms=i * 60_000 + 1000, text=f"第{i}段")
+        for i in range(10)
+    ]
+    cands = sel.build_candidates(scene_changes, segments)
+    kept = sel.thin(cands)
+    times = [c.time_ms for c in kept]
+    assert times == sorted(times)
+    assert max(times) > 400_000, "后半段也要有帧"
+
+
+def test_thin_respects_max_images():
+    cfg = FrameSelectorConfig(max_images=5, min_gap_seconds=0.0)
+    sel = FrameSelector(config=cfg)
+    cands = sel.build_candidates([(i * 100, 0.5) for i in range(50)], [])
+    kept = sel.thin(cands)
+    assert len(kept) <= 5

@@ -172,34 +172,77 @@ def parse_srt(text: str) -> list[Segment]:
     return segments
 
 
+def merged_time_intervals(
+    segments: list[Segment],
+) -> list[tuple[int, int]]:
+    """把所有字幕段的时间区间合并成不重叠的并集。"""
+    intervals = sorted(
+        (max(0, s.start_ms), s.end_ms)
+        for s in segments
+        if s.end_ms > s.start_ms
+    )
+    merged: list[tuple[int, int]] = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            prev_start, prev_end = merged[-1]
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def coverage_stats(segments: list[Segment], duration_ms: int | None) -> dict[str, Any]:
     """字幕覆盖度统计（用于 manifest 与质量度量）。
 
-    B 站 AI 字幕偶尔会带上超出视频时长的片段（例如该 P 实际时长 377s，
-    字幕却覆盖到 756s）。这种情况要**如实标记**而不是让覆盖率超过 1。
+    两个概念必须分开：
+
+    * ``segment_time_coverage``：**时间并集**占视频长度的比例——
+      把所有合法 [start,end] 与 [0,duration] 截交、合并去重后再算。
+      10 分钟视频里只有 3 秒字幕时，这个值会很低（不会因为首尾跨度大就接近 100%）。
+    * ``span_ratio``：首尾跨度占比，只是"字幕从什么时候到什么时候"的粗略信息，
+      **不能**当成实际覆盖率。
     """
     if not segments:
         return {
             "segments": 0,
+            "covered_ms": 0,
+            "segment_time_coverage": 0.0,
             "span_ms": 0,
-            "coverage_ratio": 0.0,
+            "span_ratio": 0.0,
+            "span_exceeds_duration": False,
             "chars": 0,
             "chars_per_minute": 0.0,
         }
+
     span = segments[-1].end_ms - segments[0].start_ms
     chars = sum(len(s.text) for s in segments)
     minutes = max(span, 1) / 60000
-    raw_ratio = (span / duration_ms) if duration_ms else None
-    exceeds = bool(raw_ratio is not None and raw_ratio > 1.1)
-    ratio = None
-    if raw_ratio is not None:
-        ratio = min(raw_ratio, 1.0)
+    merged = merged_time_intervals(segments)
+    covered = sum(end - start for start, end in merged)
+
+    coverage_ratio: float | None = None
+    span_ratio: float | None = None
+    if duration_ms:
+        clipped = 0
+        for start, end in merged:
+            lo = max(0, min(start, duration_ms))
+            hi = max(0, min(end, duration_ms))
+            if hi > lo:
+                clipped += hi - lo
+        coverage_ratio = min(clipped / duration_ms, 1.0)
+        span_ratio = span / duration_ms
+
     return {
         "segments": len(segments),
+        "covered_ms": covered,
+        "segment_time_coverage": (
+            round(coverage_ratio, 4) if coverage_ratio is not None else None
+        ),
         "span_ms": span,
-        "coverage_ratio": round(ratio, 4) if ratio is not None else None,
-        "raw_coverage_ratio": round(raw_ratio, 4) if raw_ratio is not None else None,
-        "span_exceeds_duration": exceeds,
+        "span_ratio": round(span_ratio, 4) if span_ratio is not None else None,
+        "span_exceeds_duration": bool(
+            duration_ms and span > duration_ms * 1.1
+        ),
         "chars": chars,
         "chars_per_minute": round(chars / minutes, 2),
     }

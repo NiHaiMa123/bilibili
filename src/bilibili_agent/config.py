@@ -86,6 +86,8 @@ class Config:
     ocr_sample_interval: float = 1.0
     ocr_band_top: float = 0.74
     ocr_band_bottom: float = 0.99
+    ocr_top_band_top: float = 0.02
+    ocr_top_band_bottom: float = 0.26
     ocr_min_score: float = 0.60
     ocr_min_coverage: float = 0.10
 
@@ -93,6 +95,7 @@ class Config:
     asr_model_path: str = ""
     asr_aligner_path: str = ""
     asr_device: str = "cuda:0"
+    asr_language: str = "auto"  # auto=自动识别；也可指定 Chinese/English 等
     asr_max_chunk_seconds: float = 120.0
     asr_sample_rate: int = 16000
 
@@ -181,6 +184,8 @@ def load_config(explicit: str | os.PathLike[str] | None = None) -> Config:
     cfg.ocr_sample_interval = float(_get(data, "ocr", "sample_interval", default=1.0))
     cfg.ocr_band_top = float(_get(data, "ocr", "band_top", default=0.74))
     cfg.ocr_band_bottom = float(_get(data, "ocr", "band_bottom", default=0.99))
+    cfg.ocr_top_band_top = float(_get(data, "ocr", "top_band_top", default=0.02))
+    cfg.ocr_top_band_bottom = float(_get(data, "ocr", "top_band_bottom", default=0.26))
     cfg.ocr_min_score = float(_get(data, "ocr", "min_score", default=0.60))
     cfg.ocr_min_coverage = float(_get(data, "ocr", "min_coverage", default=0.10))
 
@@ -188,6 +193,7 @@ def load_config(explicit: str | os.PathLike[str] | None = None) -> Config:
     cfg.asr_model_path = _resolve(_get(data, "asr", "model_path"), root)
     cfg.asr_aligner_path = _resolve(_get(data, "asr", "aligner_path"), root)
     cfg.asr_device = _get(data, "asr", "device", default="cuda:0")
+    cfg.asr_language = _get(data, "asr", "language", default="auto")
     cfg.asr_max_chunk_seconds = float(_get(data, "asr", "max_chunk_seconds", default=120.0))
     cfg.asr_sample_rate = int(_get(data, "asr", "sample_rate", default=16000))
 

@@ -15,7 +15,6 @@ from urllib.parse import urlparse
 import httpx
 
 API_BASE = "https://api.bilibili.com"
-SUBTITLE_HOST_SUFFIX = "hdslb.com"
 
 # 已知风控/权限错误码
 CODE_RISK_CONTROL = -412
@@ -214,21 +213,60 @@ class BiliClient:
         resp = self._send(method, url, params=params, headers=headers, data=data)
         return resp.json()
 
-    def get_text(self, url: str, params: dict[str, Any] | None = None) -> str:
-        """GET 纯文本（字幕正文等），不做 code 检查。"""
+    def get_text(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+        *,
+        send_cookie: bool = False,
+        url_validator=None,
+        max_redirects: int = 5,
+    ) -> str:
+        """GET 纯文本（字幕正文等），不做 code 检查。
+
+        安全约定：
+        * **默认不附带账号 Cookie**——字幕 CDN 是公开资源，没必要把登录态发出去；
+        * 手动跟随跳转，每一跳都重新用 ``url_validator`` 校验目标，
+          避免被重定向到第三方站点。
+        """
         self._bootstrap()
         self._throttle()
         client = self._get_client()
         headers: dict[str, str] = {}
-        if self.cookie_header:
+        if send_cookie and self.cookie_header:
             headers["Cookie"] = self.cookie_header
-        try:
-            resp = client.get(url, params=params, headers=headers)
-        except httpx.HTTPError as exc:
-            raise BiliApiError(f"网络请求失败：{exc}", url=url, retryable=True) from exc
-        if resp.status_code != 200:
-            raise BiliApiError(f"HTTP {resp.status_code}：{url}", code=resp.status_code, url=url)
-        return resp.text
+
+        current = url
+        for _ in range(max_redirects + 1):
+            if url_validator is not None and not url_validator(current):
+                raise BiliApiError(
+                    f"拒绝请求未经校验的地址：{current}", url=current
+                )
+            try:
+                resp = client.get(
+                    current, params=params, headers=headers, follow_redirects=False
+                )
+            except httpx.HTTPError as exc:
+                raise BiliApiError(
+                    f"网络请求失败：{exc}", url=current, retryable=True
+                ) from exc
+
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("location")
+                if not location:
+                    raise BiliApiError(
+                        f"重定向缺少 Location：{current}", url=current
+                    )
+                current = str(resp.url.join(location))
+                continue
+
+            if resp.status_code != 200:
+                raise BiliApiError(
+                    f"HTTP {resp.status_code}：{current}", code=resp.status_code, url=current
+                )
+            return resp.text
+
+        raise BiliApiError(f"重定向次数超过 {max_redirects} 次：{url}", url=url)
 
     # -- 具体接口 -------------------------------------------------------
     def search_videos(
@@ -266,13 +304,31 @@ class BiliClient:
         return data.get("data") or {}
 
 
+def _host_matches(host: str, suffix: str) -> bool:
+    """域名后缀匹配：必须是该域本身或其子域。
+
+    不能用 ``host.endswith(suffix)``——那会让 ``evilhdslb.com`` 这种
+    后缀相似的域名通过校验。
+    """
+    host = (host or "").lower().rstrip(".")
+    suffix = suffix.lower().lstrip(".")
+    return host == suffix or host.endswith("." + suffix)
+
+
+# 字幕正文允许的官方域名后缀
+SUBTITLE_HOST_SUFFIXES = ("hdslb.com", "bilibili.com")
+
+
 def is_trusted_subtitle_url(url: str) -> bool:
-    """只允许从 B 站官方 CDN 域名取字幕正文。"""
+    """校验字幕正文地址：必须是 https，且落在允许的官方域名下。"""
     try:
-        host = urlparse(url).hostname or ""
+        parsed = urlparse(url)
     except ValueError:
         return False
-    return host.endswith(SUBTITLE_HOST_SUFFIX) or host.endswith("bilibili.com")
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").lower()
+    return any(_host_matches(host, suffix) for suffix in SUBTITLE_HOST_SUFFIXES)
 
 
 def read_cookie_file(path: str | Path) -> str | None:

@@ -13,7 +13,6 @@ import json
 import shutil
 import subprocess
 import sys
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +21,7 @@ from .bdl_adapter import BdlError
 from .bili_api import BiliApiError
 from .config import load_config
 from .inspect import SourceError
+from .jobs import JobManager, JobSpec
 from .pipeline import MODES, SUBTITLE_SOURCES, Pipeline, probe_media
 
 EXIT_OK = 0
@@ -306,34 +306,42 @@ def _jobs_dir(cfg) -> Path:
 
 def cmd_fetch(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
-    job_id = uuid.uuid4().hex[:12]
     jobs_dir = _jobs_dir(cfg)
-    job_path = jobs_dir / f"{job_id}.json"
+    manager = JobManager(jobs_dir)
+
+    spec = JobSpec(
+        target=args.target,
+        parts=list(args.parts or []),
+        mode=args.mode,
+        subtitle_source=args.subtitle_source,
+        # --refresh 必须透传给 worker，否则异步会静默复用旧产物
+        refresh=bool(args.refresh),
+        max_images=args.max_images,
+        config_path=str(cfg.config_path) if cfg.config_path else "",
+    )
 
     if args.async_:
-        cmd = [
-            sys.executable, "-m", "bilibili_agent.cli", "_fetch_worker",
-            "--config", str(cfg.config_path) if cfg.config_path else "",
-            "--target", args.target,
-            "--parts", ",".join(str(p) for p in (args.parts or [])),
-            "--mode", args.mode,
-            "--subtitle-source", args.subtitle_source,
-            "--job-path", str(job_path),
-        ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        job = manager.submit(spec)
         payload = {
-            "ok": True, "status": "queued", "job_id": job_id,
-            "pid": proc.pid, "bvid": None, "parts": [], "outputs": [], "warnings": [],
+            "ok": True,
+            "status": job.get("state", "queued"),
+            "job_id": job.get("id"),
+            "pid": job.get("pid"),
+            "bvid": None, "parts": [], "outputs": [], "warnings": [],
         }
         if args.json:
             _emit_json(payload)
         else:
-            print(f"任务已启动：{job_id}（pid={proc.pid}）")
-            print(f"用 `bili status {job_id}` 查询进度")
+            print(f"任务已启动：{payload['job_id']}（pid={payload.get('pid')}）")
+            print(f"用 `bili status {payload['job_id']}` 查询进度")
         return EXIT_OK
 
     pipe = Pipeline(cfg)
+    job_id = manager.create(spec)
+    manager.update(job_id, state="running", stage="fetch")
     try:
+        if args.max_images:
+            cfg.max_images = max(1, min(int(args.max_images), 200))
         result = pipe.fetch(
             args.target, parts=args.parts, mode=args.mode,
             subtitle_source=args.subtitle_source, refresh=args.refresh,
@@ -343,7 +351,14 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
     payload = result.to_dict()
     payload["job_id"] = job_id
-    job_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    manager.update(
+        job_id,
+        state="completed" if payload.get("ok") else "failed",
+        stage="done",
+        outputs=payload.get("outputs") or [],
+        result=payload,
+        error=payload.get("error"),
+    )
 
     if args.json:
         _emit_json(payload)
@@ -364,54 +379,33 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
 
 def cmd_fetch_worker(args: argparse.Namespace) -> int:
-    """后台 worker：执行 fetch 并把结果写入 job 文件。"""
-    cfg = load_config(args.config)
-    job_path = Path(args.job_path)
-    job_path.parent.mkdir(parents=True, exist_ok=True)
-    job_path.write_text(
-        json.dumps({"ok": True, "status": "running", "stage": "fetch"},
-                   ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    pipe = Pipeline(cfg)
-    try:
-        result = pipe.fetch(
-            args.target,
-            parts=[int(p) for p in args.parts.split(",") if p.strip()] if args.parts else None,
-            mode=args.mode, subtitle_source=args.subtitle_source,
-        )
-    except Exception as exc:  # noqa: BLE001
-        payload = {"ok": False, "status": "failed",
-                   "error": {"stage": "worker", "error_code": None,
-                             "message": str(exc), "retryable": False}}
-        job_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        return EXIT_FAIL
-    finally:
-        pipe.close()
-    payload = result.to_dict()
-    job_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return EXIT_OK if payload["ok"] else EXIT_FAIL
+    """后台 worker 入口（保留兼容；实际实现已收敛到 jobs.worker_main）。"""
+    from .jobs import worker_main
+
+    return worker_main(args.job, args.jobs_dir)
 
 
 # ---------------------------------------------------------------- status
 def cmd_status(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
-    jobs_dir = _jobs_dir(cfg)
-    path = jobs_dir / f"{args.job_id}.json"
-    if not path.is_file():
+    manager = JobManager(_jobs_dir(cfg))
+    job = manager.status(args.job_id)
+    if job is None:
         return _fail(
             {"stage": "status", "error_code": -404,
              "message": f"找不到任务 {args.job_id}", "retryable": False},
             args.json,
         )
-    payload = json.loads(path.read_text(encoding="utf-8"))
     if args.json:
-        _emit_json(payload)
+        _emit_json(job)
     else:
-        print(f"任务 {args.job_id}: {payload.get('status')}")
-        for o in payload.get("outputs") or []:
+        print(f"任务 {args.job_id}: {job.get('state')}")
+        for o in job.get("outputs") or []:
             print(f"  {o}")
-    return EXIT_OK
+        err = job.get("error")
+        if err:
+            _log(f"错误：[{err.get('stage')}] {err.get('message')}")
+    return EXIT_OK if job.get("state") == "completed" else EXIT_FAIL
 
 
 # ---------------------------------------------------------------- login
@@ -589,17 +583,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_fetch.add_argument("--mode", default="subtitle", choices=list(MODES))
     p_fetch.add_argument("--subtitle-source", default="auto", choices=list(SUBTITLE_SOURCES))
     p_fetch.add_argument("--refresh", action="store_true", help="忽略缓存重新生成")
+    p_fetch.add_argument("--max-images", type=int, default=None, help="图文模式最多生成多少张关键帧")
     p_fetch.add_argument("--async", dest="async_", action="store_true", help="后台执行")
     p_fetch.add_argument("--json", action="store_true")
     p_fetch.set_defaults(func=cmd_fetch)
 
     p_worker = sub.add_parser("_fetch_worker", help=argparse.SUPPRESS)
-    p_worker.add_argument("--config", default=None)
-    p_worker.add_argument("--target", required=True)
-    p_worker.add_argument("--parts", default="")
-    p_worker.add_argument("--mode", default="subtitle")
-    p_worker.add_argument("--subtitle-source", default="auto")
-    p_worker.add_argument("--job-path", required=True)
+    p_worker.add_argument("--job", required=True)
+    p_worker.add_argument("--jobs-dir", required=True)
     p_worker.set_defaults(func=cmd_fetch_worker)
 
     p_login = sub.add_parser("login", help="扫码登录（打开网页，用 B 站 App 扫码）")

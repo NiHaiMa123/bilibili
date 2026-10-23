@@ -105,8 +105,6 @@ class FrameSelector:
             if cand is None:
                 cand = Candidate(time_ms, "transcript_anchor")
                 candidates[time_ms] = cand
-            elif cand.reason == "scene_change":
-                cand.reason = "scene_change"
             cand.linked.append(idx)
 
         # 关联最近的字幕段
@@ -123,25 +121,84 @@ class FrameSelector:
             if best is not None and best_delta is not None and best_delta <= 60_000:
                 cand.linked.append(best)
 
-        ordered = sorted(candidates.values(), key=lambda c: (-c.score, c.time_ms))
-        # 场景变化优先保留，再按时间补齐
-        ordered.sort(key=lambda c: (0 if c.reason == "scene_change" else 1, c.time_ms))
-        return ordered
+        # 评分：字幕锚（讲者正在说话的时刻）比纯画面变化更可能是"讲解点"
+        for cand in candidates.values():
+            if cand.reason == "transcript_anchor":
+                cand.score = max(cand.score, 0.25)
+
+        return sorted(candidates.values(), key=lambda c: c.time_ms)
 
     def thin(self, candidates: list[Candidate]) -> list[Candidate]:
-        """按最小间隔抽稀，并限制总数。"""
+        """按时间分桶选帧，保证全片覆盖。
+
+        之前的问题是"场景变化多的开头会吃光配额，后半段没图"。
+        现在：
+        1. 把时间轴切成若干桶，每桶先保底分配名额；
+        2. 桶内按质量分（字幕相关性 / 画面变化强度）取最优；
+        3. 剩余名额全局按分数补；
+        4. ``min_gap`` 与**已选中的帧**比较（按时间排序），局部超量时保留更好的那张；
+        5. 最终输出按时间排序。
+        """
+        if not candidates:
+            return []
+        max_images = max(1, self.config.max_images)
         gap_ms = int(self.config.min_gap_seconds * 1000)
+
+        buckets = self._bucketize(candidates)
+        per_bucket = max(1, max_images // max(len(buckets), 1))
+
+        selected: list[Candidate] = []
+        for bucket in buckets:
+            # 桶内按质量分排序后取前 per_bucket
+            ranked = sorted(
+                bucket, key=lambda c: (-c.score, c.time_ms)
+            )
+            for cand in ranked[:per_bucket]:
+                if len(selected) >= max_images:
+                    break
+                selected.append(cand)
+
+        # 剩余名额：全局按分数补（跳过与已选过近的）
+        if len(selected) < max_images:
+            rest = sorted(
+                (c for c in candidates if c not in selected),
+                key=lambda c: (-c.score, c.time_ms),
+            )
+            for cand in rest:
+                if len(selected) >= max_images:
+                    break
+                selected.append(cand)
+
+        # 按时间排序后应用最小间隔：局部超量时保留质量更高的一张
+        selected.sort(key=lambda c: c.time_ms)
         kept: list[Candidate] = []
+        for cand in selected:
+            conflict = None
+            for k in kept:
+                if abs(cand.time_ms - k.time_ms) < gap_ms:
+                    conflict = k
+                    break
+            if conflict is None:
+                kept.append(cand)
+            elif cand.score > conflict.score:
+                kept[kept.index(conflict)] = cand
+        kept.sort(key=lambda c: c.time_ms)
+        return kept[:max_images]
+
+    @staticmethod
+    def _bucketize(candidates: list[Candidate]) -> list[list[Candidate]]:
+        """按时间把候选切成若干桶（默认 8 桶）。"""
+        if not candidates:
+            return []
+        buckets_n = 8
+        start = candidates[0].time_ms
+        end = candidates[-1].time_ms
+        span = max(end - start, 1)
+        buckets: list[list[Candidate]] = [[] for _ in range(buckets_n)]
         for cand in candidates:
-            if kept and abs(cand.time_ms - kept[-1].time_ms) < gap_ms:
-                # 保留分更高的那个
-                if cand.score > kept[-1].score:
-                    kept[-1] = cand
-                continue
-            kept.append(cand)
-            if len(kept) >= self.config.max_images:
-                break
-        return kept
+            idx = int((cand.time_ms - start) / span * (buckets_n - 1))
+            buckets[min(max(idx, 0), buckets_n - 1)].append(cand)
+        return [b for b in buckets if b]
 
     # -- 抽帧与去重 -----------------------------------------------------
     def _extract(self, video: str | Path, time_ms: int, out_path: Path) -> bool:

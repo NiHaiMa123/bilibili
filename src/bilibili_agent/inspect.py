@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from .bdl_adapter import BdlAdapter
 from .bili_api import BiliApiError, BiliClient
@@ -64,6 +65,47 @@ def _bvid_from_av(client: BiliClient, av: str) -> str:
     return str(bvid)
 
 
+# 允许的短链域名（B 站官方短链）
+SHORT_LINK_HOSTS = ("b23.tv", "www.b23.tv")
+# 短链跳转后允许落到的 B 站视频域名
+ALLOWED_VIDEO_HOSTS = (
+    "bilibili.com",
+    "www.bilibili.com",
+    "m.bilibili.com",
+    "www.b23.tv",
+)
+MAX_SHORT_LINK_REDIRECTS = 5
+
+
+def is_short_link(target: str) -> bool:
+    """判断输入是否是 b23.tv 短链（按 scheme + host 判断，不用字符串包含）。"""
+    text = (target or "").strip()
+    if not text:
+        return False
+    if "://" not in text:
+        text = "https://" + text
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in SHORT_LINK_HOSTS
+
+
+def _is_allowed_video_url(url: str) -> bool:
+    """校验跳转落点是否是允许的 B 站视频域名。"""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in ALLOWED_VIDEO_HOSTS
+
+
 def _resolve_bvid(client: BiliClient, target: str) -> str:
     """把任意输入解析成 BV 号，必要时联网。"""
     text = (target or "").strip()
@@ -73,26 +115,52 @@ def _resolve_bvid(client: BiliClient, target: str) -> str:
         return bvid
     if m := _AV_RE.fullmatch(text) or re.fullmatch(r"av\d+", text, re.IGNORECASE):
         return _bvid_from_av(client, m.group(1))
-    if "b23.tv" in text:
-        # 短链跟随跳转
-        resolved = client.get_json(
-            "https://api.bilibili.com/x/web-interface/view", params={}
-        )  # 占位调用，保证连接池建立
-        del resolved
+    if is_short_link(text):
         return _resolve_short_link(client, text)
     raise SourceError(f"无法识别的视频输入：{target}")
 
 
 def _resolve_short_link(client: BiliClient, url: str) -> str:
+    """跟随 b23.tv 短链跳转，校验每一跳的目标域名。
+
+    * 只接受 https；
+    * 入口 host 必须是官方短链域名；
+    * 每一次跳转的目标都必须是允许的 B 站视频域名；
+    * 跳转次数有限；超限或落到非 B 站页面一律明确报错。
+    """
     http = client._get_client()  # noqa: SLF001 - 复用已配置 UA/超时的连接池
-    try:
-        resp = http.get(url)
-    except Exception as exc:  # noqa: BLE001 - 统一转成 SourceError
-        raise SourceError(f"短链解析失败：{exc}") from exc
-    final = str(resp.url)
-    if bvid := extract_bvid(final):
+    current = url.strip()
+    if "://" not in current:
+        current = "https://" + current
+
+    for _ in range(MAX_SHORT_LINK_REDIRECTS):
+        parsed = urlparse(current)
+        if parsed.scheme != "https":
+            raise SourceError(f"短链必须使用 https：{current}")
+        host = (parsed.hostname or "").lower()
+        if host not in SHORT_LINK_HOSTS and not _is_allowed_video_url(current):
+            raise SourceError(f"短链跳转到不允许的域名：{host or current}")
+        try:
+            resp = http.get(current)
+        except Exception as exc:  # noqa: BLE001 - 统一转成 SourceError
+            raise SourceError(f"短链解析失败：{exc}") from exc
+        final = str(resp.url)
+        if final == current:
+            break
+        current = final
+        # 落点已经不是短链了（就是目标视频页），不必再跳
+        if not is_short_link(current):
+            break
+    else:
+        raise SourceError(
+            f"短链跳转次数超过 {MAX_SHORT_LINK_REDIRECTS} 次，已放弃：{url}"
+        )
+
+    if not _is_allowed_video_url(current):
+        raise SourceError(f"短链未跳转到 B 站视频页：{current}")
+    if bvid := extract_bvid(current):
         return bvid
-    raise SourceError(f"短链未跳转到可识别的视频页：{final}")
+    raise SourceError(f"短链未跳转到可识别的视频页：{current}")
 
 
 def _parts_from_bdl(tree: dict[str, Any]) -> list[VideoPart]:

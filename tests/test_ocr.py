@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from bilibili_agent.ocr_subtitles import (
     OcrConfig,
     OcrObservation,
@@ -109,12 +111,33 @@ def test_band_defaults_to_auto():
     assert cfg.fixed_band is None
 
 
-def test_fixed_band_modes():
+def test_fixed_band_bottom_mode():
     bottom = OcrConfig(band="bottom", band_top=0.74, band_bottom=0.99)
     assert bottom.fixed_band == (0.74, 0.99)
-    top = OcrConfig(band="top", band_bottom=0.99)
-    assert top.fixed_band is not None
-    assert top.fixed_band[1] < 0.5  # 顶部
+
+
+def test_fixed_band_top_mode_uses_own_bounds():
+    """top 模式必须用独立的上下界，且不能出现 y0 >= y1。"""
+    top = OcrConfig(band="top")
+    y0, y1 = top.fixed_band
+    assert 0.0 <= y0 < y1 <= 1.0
+    assert y1 > y0
+    # 与 bottom 模式互不影响
+    bottom = OcrConfig(band="bottom")
+    assert bottom.fixed_band[0] < bottom.fixed_band[1]
+
+
+def test_fixed_band_rejects_invalid_range():
+    """非法区间必须显式报错，不能悄悄裁出空图。"""
+    for kwargs in (
+        {"band": "bottom", "band_top": 0.9, "band_bottom": 0.4},
+        {"band": "top", "top_band_top": 0.3, "top_band_bottom": 0.3},
+        {"band": "bottom", "band_top": -0.1, "band_bottom": 0.5},
+        {"band": "bottom", "band_top": 0.2, "band_bottom": 1.2},
+    ):
+        cfg = OcrConfig(**kwargs)
+        with pytest.raises(ValueError):
+            _ = cfg.fixed_band
 
 
 def test_diagnose_reports_missing_engine(monkeypatch):

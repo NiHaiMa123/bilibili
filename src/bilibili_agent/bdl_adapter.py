@@ -99,7 +99,7 @@ class BdlAdapter:
             raise BdlError(
                 f"未找到 BDL CLI 可执行文件：{self.exe_path or '(未配置)'}",
                 stage=stage,
-                error_code=None,
+                code=None,
             )
         cmd = [self.exe_path, *self._base_args(), *args]
         try:

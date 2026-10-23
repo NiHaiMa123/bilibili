@@ -45,7 +45,7 @@ class FakeClient:
     def player_v2(self, bvid, cid):
         return self.get_json("https://api.bilibili.com/x/player/v2")
 
-    def get_text(self, url, params=None):
+    def get_text(self, url, params=None, **kwargs):
         if self.subtitle_payload is None:
             return json.dumps({"body": []})
         return json.dumps(self.subtitle_payload)

@@ -60,8 +60,10 @@ class OcrConfig:
     """字幕带与采样参数。"""
 
     band: str = "auto"  # auto=自动检测 | bottom=固定底部 | top=固定顶部
-    band_top: float = 0.74  # 字幕带上沿（相对画面高度，band=bottom 时生效）
-    band_bottom: float = 0.99  # 字幕带下沿
+    band_top: float = 0.74  # bottom 模式：字幕带上沿（相对画面高度）
+    band_bottom: float = 0.99  # bottom 模式：字幕带下沿
+    top_band_top: float = 0.02  # top 模式：字幕带上沿
+    top_band_bottom: float = 0.26  # top 模式：字幕带下沿
     sample_interval: float = 1.0  # 抽帧间隔（秒）
     min_score: float = 0.60  # 单个文本框的最低置信度
     scale: int = 2  # 送入 OCR 前放大倍数（小字更稳）
@@ -81,12 +83,25 @@ class OcrConfig:
 
     @property
     def fixed_band(self) -> tuple[float, float] | None:
-        """固定字幕区；``auto`` 表示交给检测。"""
+        """固定字幕区；``auto`` 表示交给检测。
+
+        上下界使用**各自独立**的配置项（bottom 用 band_top/band_bottom，
+        top 用 top_band_top/top_band_bottom），并强制校验
+        ``0 <= y0 < y1 <= 1``，避免出现 y0 > y1 裁出空图却不报错的情况。
+        """
         if self.band == "bottom":
-            return (self.band_top, self.band_bottom)
+            return self._validated_band(self.band_top, self.band_bottom)
         if self.band == "top":
-            return (0.02, 1.0 - self.band_bottom)
+            return self._validated_band(self.top_band_top, self.top_band_bottom)
         return None
+
+    @staticmethod
+    def _validated_band(y0: float, y1: float) -> tuple[float, float]:
+        if not (0.0 <= y0 < y1 <= 1.0):
+            raise ValueError(
+                f"字幕区不合法：y0={y0}, y1={y1}（需满足 0 <= y0 < y1 <= 1）"
+            )
+        return (y0, y1)
 
 
 @dataclass(slots=True)
@@ -601,13 +616,13 @@ class SubtitleOcr:
             "band_detection": detection.to_dict(),
         }
         if duration_ms:
-            covered = sum(
-                max(0, s.end_ms - s.start_ms) for s in segments
-            )
-            result.stats["coverage_ratio"] = round(
-                min(covered / duration_ms, 1.0), 4
-            )
-            result.stats["covered_ms"] = covered
+            from .subtitle_normalize import coverage_stats
+
+            cov = coverage_stats(segments, duration_ms)
+            result.stats["coverage_ratio"] = cov["segment_time_coverage"]
+            result.stats["segment_time_coverage"] = cov["segment_time_coverage"]
+            result.stats["covered_ms"] = cov["covered_ms"]
+            result.stats["span_ratio"] = cov["span_ratio"]
         if not segments:
             result.warnings.append(
                 f"在字幕区 {band[0]:.0%}~{band[1]:.0%} 里没有识别到连续文字"

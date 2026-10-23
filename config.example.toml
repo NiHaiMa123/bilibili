@@ -59,6 +59,8 @@ model_path = ""
 aligner_path = ""
 # 推理设备
 device = "cuda:0"
+# 识别语言：auto=自动识别（默认）；也可指定 Chinese / English 等
+language = "auto"
 # 音频切块最大时长（秒）
 max_chunk_seconds = 120.0
 # 采样率

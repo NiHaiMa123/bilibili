@@ -100,4 +100,31 @@ def test_coverage_stats():
     stats = coverage_stats(segs, 100_000)
     assert stats["segments"] == 1
     assert stats["chars"] == 10
-    assert stats["coverage_ratio"] == 0.1
+    assert stats["segment_time_coverage"] == 0.1
+    assert stats["span_ratio"] == 0.1
+
+
+def test_coverage_uses_time_union_not_span():
+    """10 分钟视频里只有 3 秒字幕 → 覆盖率必须很低，不能接近 100%。"""
+    segs = parse_bilibili_subtitle([
+        {"from": 0.0, "to": 1.0, "content": "一"},
+        {"from": 300.0, "to": 301.0, "content": "二"},
+        {"from": 599.0, "to": 600.0, "content": "三"},
+    ])
+    stats = coverage_stats(segs, 600_000)
+    # 时间并集 = 3 秒 / 600 秒 = 0.5%
+    assert stats["segment_time_coverage"] == 0.005
+    # 首尾跨度仍然很大，但它是 span_ratio，不能冒充覆盖率
+    assert stats["span_ratio"] == 1.0
+    assert stats["segment_time_coverage"] < stats["span_ratio"]
+
+
+def test_coverage_merges_overlapping_segments():
+    segs = parse_bilibili_subtitle([
+        {"from": 0.0, "to": 5.0, "content": "一"},
+        {"from": 3.0, "to": 9.0, "content": "二"},
+    ])
+    stats = coverage_stats(segs, 10_000)
+    # 重叠部分不重复计算 → 0~9s = 9s
+    assert stats["covered_ms"] == 9000
+    assert stats["segment_time_coverage"] == 0.9

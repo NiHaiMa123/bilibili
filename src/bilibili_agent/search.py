@@ -111,31 +111,44 @@ class SearchProvider:
         limit: int = 20,
         order: str = "totalrank",
         page: int = 1,
+        max_requests: int = 5,
     ) -> list[SearchHit]:
-        """返回去重后的候选列表。``order`` 接受语义名或接口原始值。"""
+        """返回去重后的候选列表。``order`` 接受语义名或接口原始值。
+
+        ``limit`` 大于单页容量（20）时按需翻页：去重后仍不足才继续请求，
+        总请求数受 ``max_requests`` 限制；接口报错（风控等）直接抛出并停止，
+        不做重试循环。
+        """
         keyword = (keyword or "").strip()
         if not keyword:
             raise BiliApiError("搜索关键词为空", code=-400)
         api_order = ORDERS.get(order, order or "totalrank")
         limit = max(1, min(int(limit), 50))
-
-        data = self.client.search_videos(
-            keyword, page=page, order=api_order, page_size=min(limit, 20)
-        )
-        raw_results = data.get("result") or []
+        page_size = min(limit, 20)
 
         hits: list[SearchHit] = []
         seen: set[str] = set()
-        for raw in raw_results:
-            hit = hit_from_raw(raw, rank_reason=f"order={api_order}")
-            if hit is None or hit.bvid in seen:
-                continue
-            seen.add(hit.bvid)
-            hits.append(hit)
-            if len(hits) >= limit:
-                break
+        current_page = max(1, int(page))
+        requests = 0
 
-        if not hits and data.get("numResults") in (None, 0):
-            # 接口正常但无结果：如实返回空列表，不伪造候选
-            return []
+        while len(hits) < limit and requests < max_requests:
+            data = self.client.search_videos(
+                keyword, page=current_page, order=api_order, page_size=page_size
+            )
+            requests += 1
+            results = data.get("result") or []
+            if not results:
+                break
+            for raw in results:
+                hit = hit_from_raw(raw, rank_reason=f"order={api_order}")
+                if hit is None or hit.bvid in seen:
+                    continue
+                seen.add(hit.bvid)
+                hits.append(hit)
+                if len(hits) >= limit:
+                    break
+            if len(results) < page_size:
+                break  # 已经到最后一页
+            current_page += 1
+
         return hits
