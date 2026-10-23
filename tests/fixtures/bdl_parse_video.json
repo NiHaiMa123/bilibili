@@ -1,0 +1,95 @@
+{
+  "source": {
+    "id": "video:BV1xx411c7mD",
+    "kind": "video",
+    "input": "BV1xx411c7mD",
+    "title": "字幕君交流场所",
+    "loaded_count": 1,
+    "total_count": 1,
+    "has_more": false
+  },
+  "groups": [
+    {
+      "id": "group:BV1xx411c7mD",
+      "kind": "video",
+      "title": "字幕君交流场所",
+      "items": [
+        {
+          "nfo_metadata": {
+            "title": "",
+            "part_title": "",
+            "description": "www",
+            "genre": "",
+            "uploader": "",
+            "publish_date": "",
+            "duration_seconds": null,
+            "bvid": "",
+            "cid": null,
+            "aid": null,
+            "owner_mid": null,
+            "part_index": 0,
+            "index": 0,
+            "source_title": "",
+            "date": "",
+            "quality": "",
+            "codec": "",
+            "source_url": ""
+          },
+          "id": "item:BV1xx411c7mD",
+          "title": "字幕君交流场所",
+          "owner_name": "碧诗",
+          "owner_mid": 2,
+          "publish_date": "2009-09-09",
+          "cover_url": "https://i0.hdslb.com/bfs/archive/transparent.png",
+          "duration_seconds": 2055,
+          "parts": [
+            {
+              "id": "part:BV1xx411c7mD:62131",
+              "title": "字幕君交流场所",
+              "aid": 2,
+              "bvid": "BV1xx411c7mD",
+              "cid": 62131,
+              "duration_seconds": 2055,
+              "streams": [],
+              "assets": [
+                {
+                  "kind": "cover",
+                  "format": null,
+                  "fetch_policy": "on_demand",
+                  "urls": [],
+                  "headers": []
+                },
+                {
+                  "kind": "danmaku",
+                  "format": "xml",
+                  "fetch_policy": "on_demand",
+                  "urls": [
+                    "https://comment.bilibili.com/62131.xml"
+                  ],
+                  "headers": [
+                    {
+                      "name": "Referer",
+                      "value": "https://www.bilibili.com/"
+                    },
+                    {
+                      "name": "User-Agent",
+                      "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    }
+                  ]
+                },
+                {
+                  "kind": "nfo",
+                  "format": null,
+                  "fetch_policy": "on_demand",
+                  "urls": [],
+                  "headers": []
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "page": null
+    }
+  ]
+}

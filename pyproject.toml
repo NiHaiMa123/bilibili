@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bilibili-agent"
+version = "0.1.0"
+description = "Bilibili video retrieval + transcript/illustrated Markdown pipeline for coding Agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "httpx>=0.27",
+    "segno>=1.6",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2"]
+ocr = ["rapidocr>=3.10", "onnxruntime>=1.20", "opencv-python-headless>=4.10"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+bili = "bilibili_agent.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bilibili_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["F", "E9", "W", "I", "UP", "B", "RET", "C4"]
+ignore = ["B905"]  # zip(strict=) 在 3.10+ 才有意义，本项目支持 3.11 但代码里按需标注

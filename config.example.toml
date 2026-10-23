@@ -1,0 +1,82 @@
+# bilibili-agent 配置示例
+#
+# 复制为 config.toml 后按需修改；config.toml 已被 .gitignore 忽略。
+# 所有路径都支持中文与空格，程序内部一律以参数数组方式调用外部进程。
+
+[paths]
+# BDL 命令行程序（独立 CLI，不是桌面版 EXE）
+bdl_cli = "E:/tools/bdl/bdl.exe"
+# FFmpeg / FFprobe 可执行文件；留空则从 PATH 探测
+ffmpeg = ""
+ffprobe = ""
+
+# 下载的音视频缓存目录
+media_cache = ".cache/media"
+# 生成的 Markdown / manifest 输出目录
+output_dir = "output"
+# 临时文件目录（音频切块、抽帧中间产物）
+temp_dir = ".cache/tmp"
+
+[bilibili]
+# 登录 Cookie 文件（UTF-8 完整 Cookie header）。留空表示只用公开接口。
+# 未登录时：普通公开视频可解析/下载；受限视频、会员内容、部分 AI 字幕不可用。
+cookie_file = ""
+# 请求 User-Agent
+user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+# 搜索接口节流（秒）
+request_interval = 0.6
+
+[search]
+# 默认返回条数
+limit = 20
+# totalrank | click | pubdate | dm | stow | scores
+order = "totalrank"
+
+[subtitle]
+# 字幕语言优先级（按顺序匹配 B 站 lan 字段）
+preferred_languages = ["zh-Hans", "zh-CN", "zh-Hant", "zh"]
+# 至少要有多少条字幕才认为该字幕源有效
+min_segments = 3
+
+[frame]
+# 抽帧最长边
+max_edge = 1280
+# 图片格式 jpg | webp | png
+format = "jpg"
+# 最多生成多少张图
+max_images = 25
+# 两张图片之间的最小间隔（秒）
+min_gap_seconds = 3.0
+# 感知哈希去重阈值（越小越严格）
+phash_distance = 6
+
+[asr]
+# 运行 Qwen3-ASR 的 Python 解释器（需已安装 torch + qwen_asr）
+python = ""
+# Qwen3-ASR 模型目录（复用 E:\project\tts 的本地模型）
+model_path = ""
+# 强制对齐模型目录（可选）。有它时 ASR 给出字/词级时间戳
+aligner_path = ""
+# 推理设备
+device = "cuda:0"
+# 音频切块最大时长（秒）
+max_chunk_seconds = 120.0
+# 采样率
+sample_rate = 16000
+
+[ocr]
+# 烧录字幕 OCR（Level 3）。需要 rapidocr + onnxruntime
+enabled = true
+# auto 模式下是否尝试 OCR（需要下载视频，耗时较长）
+auto = true
+# 字幕区：auto=自动检测 | bottom=固定底部 | top=固定顶部
+band = "auto"
+# 抽帧间隔（秒）
+sample_interval = 1.0
+# band=bottom 时使用的固定区域（相对画面高度）
+band_top = 0.74
+band_bottom = 0.99
+# 文字框最低置信度
+min_score = 0.60
+# OCR 覆盖率低于该值时改走 ASR
+min_coverage = 0.10

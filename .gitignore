@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Local caches / outputs (media, subtitles, generated markdown)
+.cache/
+output/
+
+# Credentials — never commit
+config.toml
+*.cookie
+cookie.txt
+.env
+.env.*
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
