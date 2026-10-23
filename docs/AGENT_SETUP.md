@@ -113,4 +113,22 @@ bili status <job_id> --json
 3. `bili_materialize(mode="subtitle")` → 返回 `outputs` 里的本地
    `transcript.md` 路径；再用 `bili_read_transcript` 按时间段取到正文。
 
+### 长任务走异步
+
+OCR / ASR / 图文模式可能跑几分钟，Agent 调用会超时。`bili_materialize` 的
+`wait=false` 会**提交一个持久本地任务并立刻返回** `job_id`（不是阻塞计算）：
+
+```json
+{"ok": true, "status": "queued", "job_id": "a1b2c3d4e5f6", "pid": 12345}
+```
+
+之后轮询 `bili_job_status(job_id)`，状态为
+`queued → running → completed / failed`：
+
+* `completed` → `outputs` 里有产物路径，`chapters` 里有章节索引；
+* `failed` → `error` 里带 `stage` 与可读原因（不会永远停在 running）。
+
+任务状态目录：`<output_dir>/../.cache/tmp/jobs`（与 `bili fetch --async`
+用的是同一套协议与同一批文件），状态文件是原子替换写入的，读取不会看到半截 JSON。
+
 完整回归矩阵见 [`PROGRESS.md`](PROGRESS.md)。

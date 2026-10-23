@@ -1,20 +1,22 @@
 """Level 3：画面烧录字幕 OCR。
 
-只认**真正在对白字幕**，不把 PPT 标题、B 站水印、界面文字当对白：
+本轮（docs/REVIEW_FIX_OCR.md 的 O1~O4）把原来的"底部固定条 + 全文频率剔除"
+升级为：
 
-1. 先在字幕带（画面底部/顶部的窄条）里取文本，避免整屏 UI 文字污染；
-2. 按固定间隔抽帧，逐帧 OCR；
-3. 相邻帧文本相似则合并成一句，记录首次/末次出现时间；
-4. 过滤水印区域与低置信度片段；
-5. 计算覆盖度（有效字幕时长 / 视频时长、每分钟有效字数）。
-
-引擎：RapidOCR 3.x（ONNX Runtime + **PP-OCRv6** 模型），纯 CPU 可跑，无需 torch。
+* **O1 时序字幕区跟踪**：用 ``subtitle_region.SubtitleRegionTracker`` 在多个
+  时间窗口上跟踪文字轨迹，得到**四维 ROI**（x0,y0,x1,y1）与可解释的 evidence。
+* **O1-2 时序判定**：不再按"整片 15% 频率"删句。变化触发式识别天然保留
+  "同一句字幕持续 1~10 秒"；跨窗口长期不变的文字判为界面静态文字，
+  转入 on_screen_text 通道。
+* **O1-3 多行字幕与横向范围**：ROI 内按行分组，支持 1~3 行；
+  裁剪按四维 ROI 进行，左右 UI 密集区不干扰。
+* **O2 触发式识别**：ROI 内像素几乎不变就跳过 OCR；文本转场时二分细化起止时间。
+* **O3/O4 证据分离**：对白进 transcript，界面文字进 on_screen_text。
 """
 
 from __future__ import annotations
 
 import difflib
-import json
 import re
 import shutil
 import subprocess
@@ -31,28 +33,7 @@ _WATERMARK_PATTERNS = (
     re.compile(r"哔哩哔哩"),
     re.compile(r"^\s*@[\w\-一-鿿]+"),
 )
-# 纯符号/颜文字行
 _NOISE_RE = re.compile(r"^[\s\W_]+$", re.UNICODE)
-
-
-@dataclass(slots=True)
-class BandDetection:
-    """自动检测到的字幕区。"""
-
-    top: float
-    bottom: float
-    confidence: float
-    evidence: list[dict[str, Any]] = field(default_factory=list)
-    method: str = "auto"
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "top": round(self.top, 4),
-            "bottom": round(self.bottom, 4),
-            "confidence": round(self.confidence, 4),
-            "method": self.method,
-            "evidence": self.evidence[:12],
-        }
 
 
 @dataclass(slots=True)
@@ -60,35 +41,42 @@ class OcrConfig:
     """字幕带与采样参数。"""
 
     band: str = "auto"  # auto=自动检测 | bottom=固定底部 | top=固定顶部
-    band_top: float = 0.74  # bottom 模式：字幕带上沿（相对画面高度）
-    band_bottom: float = 0.99  # bottom 模式：字幕带下沿
-    top_band_top: float = 0.02  # top 模式：字幕带上沿
-    top_band_bottom: float = 0.26  # top 模式：字幕带下沿
-    sample_interval: float = 1.0  # 抽帧间隔（秒）
-    min_score: float = 0.60  # 单个文本框的最低置信度
-    scale: int = 2  # 送入 OCR 前放大倍数（小字更稳）
-    similarity: float = 0.72  # 相邻帧判为同一句的相似度阈值
-    min_duration_ms: int = 700  # 短于这个时长的片段丢弃
-    min_samples: int = 2  # 至少连续出现这么多帧才认作一句（过滤闪烁噪声）
+    band_top: float = 0.74
+    band_bottom: float = 0.99
+    top_band_top: float = 0.02
+    top_band_bottom: float = 0.26
+    sample_interval: float = 1.0
+    min_score: float = 0.60
+    scale: int = 2
+    similarity: float = 0.72
+    min_duration_ms: int = 700
+    min_samples: int = 2
     watermark_filter: bool = True
     max_chars: int = 80
-    # 字幕文字的几何约束（相对画面尺寸）
-    min_text_height: float = 0.020  # 太小的是界面小字/任务栏时钟，不是字幕
-    max_text_height: float = 0.16  # 太大的是标题/大字报
-    center_tolerance: float = 0.30  # 字幕一般水平居中，允许偏离中心的幅度
-    static_text_ratio: float = 0.15  # 跨帧出现比例超过它 → 判为界面静态文字
-    # 自动检测字幕区
-    detect_samples: int = 12  # 用于检测的采样帧数
-    detect_padding: float = 0.035  # 字幕区上下留白（相对画面高度）
+    min_text_height: float = 0.020
+    max_text_height: float = 0.16
+    center_tolerance: float = 0.30
+    static_text_ratio: float = 0.15
+    detect_samples: int = 12
+    detect_padding: float = 0.035
+    # O1 区域跟踪
+    region_windows: int = 6
+    region_window_seconds: float = 6.0
+    region_fps: float = 3.0
+    region_min_score: float = 0.35
+    # O2 触发式识别
+    change_threshold: float = 0.012  # ROI 内像素变化阈值
+    dense_fps: float = 3.0  # 变更窗口的加密帧率
+    refine_boundaries: bool = True
+    max_lines: int = 3
+    # O1-2 静态判定
+    static_min_duration_ms: int = 20_000
+    # O4 画面文字通道的条数上限（避免 manifest 过大）
+    max_on_screen_text: int = 50
 
     @property
     def fixed_band(self) -> tuple[float, float] | None:
-        """固定字幕区；``auto`` 表示交给检测。
-
-        上下界使用**各自独立**的配置项（bottom 用 band_top/band_bottom，
-        top 用 top_band_top/top_band_bottom），并强制校验
-        ``0 <= y0 < y1 <= 1``，避免出现 y0 > y1 裁出空图却不报错的情况。
-        """
+        """固定字幕区；``auto`` 表示交给检测。"""
         if self.band == "bottom":
             return self._validated_band(self.band_top, self.band_bottom)
         if self.band == "top":
@@ -106,11 +94,13 @@ class OcrConfig:
 
 @dataclass(slots=True)
 class OcrObservation:
-    """某一帧上看到的一行字幕。"""
+    """某一帧上看到的一行（或多行）字幕。"""
 
     time_ms: int
     text: str
     score: float
+    lines: int = 1
+    error: str | None = None  # 引擎异常；与"没有字幕"区分开
 
 
 @dataclass(slots=True)
@@ -122,14 +112,12 @@ class OcrResult:
 
 
 def normalize_text(text: str) -> str:
-    """归一化：去空白、全角转半角常见符号，便于比较相似度。"""
     text = re.sub(r"\s+", "", text or "")
     text = text.replace("，", ",").replace("。", ".")
     return text.strip()
 
 
 def similarity(a: str, b: str) -> float:
-    """两段文本的相似度（0~1）。"""
     na, nb = normalize_text(a), normalize_text(b)
     if not na or not nb:
         return 0.0
@@ -139,11 +127,24 @@ def similarity(a: str, b: str) -> float:
 
 
 def is_watermark(text: str) -> bool:
-    """判断是不是水印/账号名等非对白内容。"""
     compact = (text or "").strip()
     if not compact:
         return True
     return any(p.search(compact) for p in _WATERMARK_PATTERNS)
+
+
+@dataclass(slots=True)
+class Roi:
+    """四维字幕区（相对画面坐标）。"""
+
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    method: str = "auto"
+
+    def as_tuple(self) -> tuple[float, float, float, float]:
+        return (self.x0, self.y0, self.x1, self.y1)
 
 
 class SubtitleOcr:
@@ -183,14 +184,13 @@ class SubtitleOcr:
 
     def _get_engine(self):
         if self._engine is None:
-            from rapidocr import RapidOCR
+            from .ocr_engine import get_engine
 
-            self._engine = RapidOCR()
+            self._engine = get_engine()
         return self._engine
 
     # -- 抽帧 -----------------------------------------------------------
     def extract_frames(self, video: str | Path, out_dir: Path) -> list[Path]:
-        """按固定间隔把视频拆成图片，返回文件列表（按时间序）。"""
         if not self.ffmpeg:
             raise RuntimeError("未找到 ffmpeg，无法抽帧")
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -213,324 +213,183 @@ class SubtitleOcr:
             raise RuntimeError(f"ffmpeg 抽帧失败：{' | '.join(tail)}")
         return sorted(out_dir.glob("f_*.jpg"))
 
-    # -- 字幕区自动检测 --------------------------------------------------
-    def _probe_duration(self, video: str | Path) -> float:
-        """用 ffprobe 取视频时长（秒）。"""
-        ffprobe = shutil.which("ffprobe") or ""
-        if not ffprobe:
-            return 0.0
-        try:
-            proc = subprocess.run(
-                [ffprobe, "-v", "quiet", "-print_format", "json",
-                 "-show_format", str(video)],
-                capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=120,
-            )
-            data = json.loads(proc.stdout or "{}")
-            return float((data.get("format") or {}).get("duration") or 0.0)
-        except (subprocess.SubprocessError, OSError, ValueError):
-            return 0.0
+    # -- ROI 内的文字 ----------------------------------------------------
+    def _crop_roi(self, image, roi: Roi):
+        h, w = image.shape[:2]
+        x0 = max(0, int(roi.x0 * w))
+        x1 = min(w, int(roi.x1 * w))
+        y0 = max(0, int(roi.y0 * h))
+        y1 = min(h, int(roi.y1 * h))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return image[y0:y1, x0:x1]
 
-    def _extract_sample_frames(
-        self, video: str | Path, out_dir: Path, samples: int
-    ) -> list[Path]:
-        """在整段视频上均匀抽 ``samples`` 帧。"""
-        if not self.ffmpeg:
-            return []
-        duration = self._probe_duration(video)
-        if duration <= 0:
-            return []
-        fps = max(samples / duration, 1e-4)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        pattern = str(out_dir / "d_%06d.jpg")
-        cmd = [
-            self.ffmpeg, "-hide_banner", "-nostats", "-y",
-            "-i", str(video),
-            "-vf", f"fps={fps:.8f}",
-            "-q:v", "4",
-            pattern,
-        ]
-        try:
-            subprocess.run(cmd, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=1800)
-        except (subprocess.SubprocessError, OSError):
-            return []
-        return sorted(out_dir.glob("d_*.jpg"))
-
-    def detect_band(self, video: str | Path, work_dir: Path) -> BandDetection:
-        """**自动框出字幕区**，不依赖写死的位置。
-
-        判据：**字幕每句都在变，界面文字不会变**。
-        把整帧里所有文字框按高度聚成若干"行带"，
-        同一个行带在不同采样帧里出现过**不同文字**的，就是字幕带；
-        一直不变的（菜单、文件名、任务栏时钟、状态栏）就不是。
-
-        返回值带置信度与证据（采样到的动态文字），
-        便于人工或 Agent 复核，也可以据此在 manifest 里留下可审计的痕迹。
-        """
-        fallback = BandDetection(
-            top=self.config.band_top, bottom=self.config.band_bottom,
-            confidence=0.0, method="fallback",
-        )
-        frames = self._extract_sample_frames(
-            video, Path(work_dir) / "detect", self.config.detect_samples
-        )
-        if not frames:
-            return fallback
-
-        try:
-            import cv2
-        except ImportError:  # pragma: no cover
-            return fallback
-
-        engine = self._get_engine()
-        samples: list[list[dict]] = []
-        for frame in frames:
-            img = cv2.imread(str(frame))
-            if img is None:
-                samples.append([])
-                continue
-            h, w = img.shape[:2]
-            # 整帧 OCR，先缩到 960 宽提速
-            ratio = min(1.0, 960.0 / max(w, 1))
-            if ratio < 1.0:
-                img = cv2.resize(
-                    img, (max(int(w * ratio), 1), max(int(h * ratio), 1)),
-                    interpolation=cv2.INTER_AREA,
-                )
-            out = engine(img)
-            raw_texts = getattr(out, "txts", None)
-            raw_scores = getattr(out, "scores", None)
-            raw_boxes = getattr(out, "boxes", None)
-            texts = [] if raw_texts is None else list(raw_texts)
-            scores = [] if raw_scores is None else list(raw_scores)
-            boxes = [] if raw_boxes is None else list(raw_boxes)
-
-            items: list[dict] = []
-            for idx, (text, score) in enumerate(zip(texts, scores, strict=False)):
-                if score < self.config.min_score:
-                    continue
-                text = (text or "").strip()
-                if not text or _NOISE_RE.match(text):
-                    continue
-                if idx >= len(boxes) or boxes[idx] is None:
-                    continue
-                xs = [float(p[0]) for p in boxes[idx]]
-                ys = [float(p[1]) for p in boxes[idx]]
-                inv = 1.0 / max(ratio, 1e-6)
-                bh = (max(ys) - min(ys)) * inv / max(h, 1)
-                cy = (sum(ys) / len(ys)) * inv / max(h, 1)
-                cx = (sum(xs) / len(xs)) * inv / max(w, 1)
-                if bh < self.config.min_text_height or bh > self.config.max_text_height:
-                    continue
-                items.append({"text": text, "cy": cy, "cx": cx, "h": bh})
-            samples.append(items)
-
-        # 按 cy 聚成"行带"（容差 3% 画面高度，非链式，避免整段并成一条）
-        all_cy = sorted({round(b["cy"], 3) for items in samples for b in items})
-        clusters: list[list[float]] = []
-        for cy in all_cy:
-            if clusters and abs(cy - clusters[-1][0]) <= 0.03:
-                clusters[-1].append(cy)
-            else:
-                clusters.append([cy])
-
-        evidence: list[dict] = []
-        dynamic: list[dict] = []
-        for cluster in clusters:
-            lo, hi = min(cluster), max(cluster)
-            texts_in: set[str] = set()
-            heights: list[float] = []
-            for items in samples:
-                for b in items:
-                    if lo - 0.03 <= b["cy"] <= hi + 0.03:
-                        texts_in.add(b["text"])
-                        heights.append(b["h"])
-            mean_h = sum(heights) / len(heights) if heights else 0.0
-            record = {
-                "cy": round(sum(cluster) / len(cluster), 3),
-                "text_height": round(mean_h, 4),
-                "distinct_samples": len(texts_in),
-                "examples": list(texts_in)[:4],
-                "dynamic": len(texts_in) >= 2,
-            }
-            evidence.append(record)
-            if record["dynamic"]:
-                dynamic.append(record)
-
-        if not dynamic:
-            return fallback
-
-        # 在所有"会变的文字带"里挑**字号最大**的那条——字幕总是比
-        # 文件名、状态栏、时钟大得多。挑最靠下的会被任务栏骗，挑最大的不会。
-        best = max(dynamic, key=lambda e: e["text_height"])
-        pad = self.config.detect_padding
-        top = max(0.0, best["cy"] - pad)
-        bottom = min(1.0, best["cy"] + best["text_height"] + pad)
-        confidence = round(min(1.0, best["text_height"] / max(self.config.min_text_height, 1e-6) / 2), 3)
-        return BandDetection(
-            top=top, bottom=bottom, confidence=confidence,
-            evidence=sorted(evidence, key=lambda e: e["cy"]),
-            method="auto",
-        )
-
-    # -- OCR ------------------------------------------------------------
-    def _ocr_boxes(self, image_path: Path, band: tuple[float, float]) -> list[dict]:
-        """对单帧的指定区域做 OCR，返回该帧所有候选文字框。
-
-        字幕带里往往还混着界面文字（文件名、按钮、菜单、任务栏时钟）。
-        这里只做**逐框**的几何与置信度过滤，选行交给上层，
-        这样才能在跨帧统计里识别出"一直不变的界面文字"。
-        """
-        try:
-            import cv2
-        except ImportError as exc:  # pragma: no cover
-            raise RuntimeError("缺少 opencv（opencv-python-headless）") from exc
-
-        img = cv2.imread(str(image_path))
-        if img is None:
-            return []
-        h, w = img.shape[:2]
-        top, bottom = band
-        y0, y1 = int(h * top), int(h * bottom)
-        crop = img[y0:y1, :]
-        if crop.size == 0:
-            return []
+    def _ocr_roi(
+        self, crop, roi: Roi, frame_size: tuple[int, int] | None = None
+    ) -> list[list[Any]]:
+        """对 ROI 内的文字按行分组，返回 [[(text, score), ...], ...]（按 y 排序）。"""
         if self.config.scale > 1:
+            import cv2
+
             crop = cv2.resize(
                 crop, None, fx=self.config.scale, fy=self.config.scale,
                 interpolation=cv2.INTER_CUBIC,
             )
+        boxes = self._get_engine().boxes(crop)
+        if not boxes:
+            return []
 
-        out = self._get_engine()(crop)
-        # 注意：boxes 是 numpy 数组，不能用 `or []` 兜底（会触发真值判断报错）
-        raw_texts = getattr(out, "txts", None)
-        raw_scores = getattr(out, "scores", None)
-        raw_boxes = getattr(out, "boxes", None)
-        texts = [] if raw_texts is None else list(raw_texts)
-        scores = [] if raw_scores is None else list(raw_scores)
-        boxes = [] if raw_boxes is None else list(raw_boxes)
-
-        cands: list[dict] = []
-        for idx, (text, score) in enumerate(zip(texts, scores, strict=False)):
-            if score < self.config.min_score:
+        crop_h, crop_w = crop.shape[:2]
+        frame_h, frame_w = frame_size or (crop_h, crop_w)
+        # 引擎返回的是**相对裁剪块**的坐标（0~1），换算回整幅画面
+        crop_w_rel = (roi.x1 - roi.x0) or 1.0
+        crop_h_rel = (roi.y1 - roi.y0) or 1.0
+        items: list[dict] = []
+        for box in boxes:
+            if box.score < self.config.min_score:
                 continue
-            text = (text or "").strip()
+            text = box.text.strip()
             if not text or _NOISE_RE.match(text):
                 continue
             if self.config.watermark_filter and is_watermark(text):
                 continue
-            if idx >= len(boxes) or boxes[idx] is None:
-                continue
-            xs = [float(p[0]) for p in boxes[idx]]
-            ys = [float(p[1]) for p in boxes[idx]]
-            scale = max(self.config.scale, 1)
-            cx = (sum(xs) / len(xs)) / scale / max(w, 1)
-            cy = (sum(ys) / len(ys)) / scale / max(h, 1) + top
-            bh = (max(ys) - min(ys)) / scale / max(h, 1)
-            bw = (max(xs) - min(xs)) / scale / max(w, 1)
-            if bh < self.config.min_text_height or bh > self.config.max_text_height:
-                continue
-            if abs(cx - 0.5) > self.config.center_tolerance:
-                continue
-            cands.append({"text": text, "score": float(score), "cx": cx,
-                          "cy": cy, "w": bw, "h": bh})
-        return cands
+            cx = roi.x0 + box.cx * crop_w_rel
+            cy = roi.y0 + box.cy * crop_h_rel
+            x0 = roi.x0 + box.x0 * crop_w_rel
+            h = box.h * crop_h_rel
+            items.append({
+                "text": text, "score": box.score,
+                "x0": x0, "cx": cx, "cy": cy, "h": h,
+            })
 
-    @staticmethod
-    def _pick_line(cands: list[dict]) -> list[dict]:
-        """从候选框里挑出"对白字幕那一行"。
-
-        规则：**字幕是这段里最大的文字**。
-        不能简单取"最下面一行"——Windows 任务栏时钟、播放器状态栏都比字幕更低，
-        但字号小得多。字号相近时才优先选更靠下的。
-        """
-        if not cands:
+        if not items:
             return []
-        ordered = sorted(cands, key=lambda c: c["cy"])
+
+        # 按 y 聚成行
+        items.sort(key=lambda c: c["cy"])
         lines: list[list[dict]] = []
-        for c in ordered:
+        for c in items:
             if lines and abs(c["cy"] - lines[-1][-1]["cy"]) <= max(c["h"], 0.01) * 0.8:
                 lines[-1].append(c)
             else:
                 lines.append([c])
-
-        def line_height(ln: list[dict]) -> float:
-            return max(c["h"] for c in ln)
-
-        def line_cy(ln: list[dict]) -> float:
-            return sum(c["cy"] for c in ln) / len(ln)
-
-        best = max(lines, key=line_height)
-        tallest = line_height(best)
+        # O1-3：按真实 y 顺序取前 N 行，同行按 x 顺序
+        lines.sort(key=lambda ln: sum(c["cy"] for c in ln) / len(ln))
+        lines = lines[: self.config.max_lines]
+        out: list[list[Any]] = []
         for ln in lines:
-            if ln is best:
-                continue
-            if line_height(ln) >= tallest * 0.8 and line_cy(ln) > line_cy(best):
-                best = ln
-        return sorted(best, key=lambda c: c["cx"])
+            ln.sort(key=lambda c: c["x0"])
+            out.append([(c["text"], c["score"]) for c in ln])
+        return out
 
+    @staticmethod
+    def _lines_to_text(lines: list[list[Any]]) -> tuple[str, float, int]:
+        """把多行合成一段文本（行间保留换行）。"""
+        if not lines:
+            return "", 0.0, 0
+        texts = ["".join(t for t, _ in ln).strip() for ln in lines]
+        texts = [t for t in texts if t]
+        if not texts:
+            return "", 0.0, 0
+        scores = [s for ln in lines for _, s in ln]
+        return "\n".join(texts), sum(scores) / len(scores), len(texts)
+
+    # -- 变化检测（O2） ---------------------------------------------------
+    @staticmethod
+    def _roi_change(prev, curr) -> float:
+        """ROI 内的归一化像素变化量（0~1）。"""
+        if prev is None or curr is None:
+            return 1.0
+        import cv2
+        import numpy as np
+
+        a = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY) if prev.ndim == 3 else prev
+        b = cv2.cvtColor(curr, cv2.COLOR_BGR2GRAY) if curr.ndim == 3 else curr
+        size = (32, 18)
+        a = cv2.resize(a, size, interpolation=cv2.INTER_AREA).astype("float32")
+        b = cv2.resize(b, size, interpolation=cv2.INTER_AREA).astype("float32")
+        return float(np.abs(a - b).mean() / 255.0)
+
+    # -- 主识别 ---------------------------------------------------------
     def observe(
         self,
         video: str | Path,
         work_dir: Path,
-        band: tuple[float, float],
+        roi: Roi,
     ) -> list[OcrObservation]:
-        """抽帧 + OCR，得到逐帧观察结果。
+        """抽帧 + ROI 内识别，得到逐帧观察结果。
 
-        两遍处理：先统计所有帧里出现过的文字框，再把**跨帧基本不变**的
-        （界面文字、水印、状态栏）剔除掉——字幕每句都在变，界面文字不会。
+        变化触发：ROI 几乎没变就跳过 OCR，沿用上一帧的文本——
+        这正好让"同一句字幕持续好几秒"被完整保留。
         """
         frames = self.extract_frames(video, work_dir)
         interval_ms = int(self.config.sample_interval * 1000)
-
-        per_frame: list[list[dict]] = []
-        for frame in frames:
-            try:
-                per_frame.append(self._ocr_boxes(frame, band))
-            except Exception:  # noqa: BLE001
-                per_frame.append([])
-
-        # 统计"同一段文字在同一位置"出现的次数
-        freq: dict[tuple, int] = {}
-        for boxes in per_frame:
-            for b in boxes:
-                key = (b["text"], round(b["cx"], 2), round(b["cy"], 2))
-                freq[key] = freq.get(key, 0) + 1
-        static_threshold = max(3, int(len(frames) * self.config.static_text_ratio))
-
         observations: list[OcrObservation] = []
-        for idx, boxes in enumerate(per_frame):
+        last_text = ""
+        last_score = 0.0
+        last_lines = 0
+        prev_crop = None
+
+        for idx, frame in enumerate(frames):
             time_ms = idx * interval_ms
-            dynamic = [
-                b for b in boxes
-                if freq[(b["text"], round(b["cx"], 2), round(b["cy"], 2))] < static_threshold
-            ]
-            line = self._pick_line(dynamic)
-            if not line:
-                observations.append(OcrObservation(time_ms, "", 0.0))
+            try:
+                import cv2
+
+                image = cv2.imread(str(frame))
+            except Exception:  # noqa: BLE001
+                image = None
+            if image is None:
+                observations.append(
+                    OcrObservation(time_ms, "", 0.0, error="read_frame_failed")
+                )
                 continue
-            merged = "".join(c["text"] for c in line)
-            if len(merged) > self.config.max_chars:
-                merged = merged[: self.config.max_chars]
-            avg_score = sum(c["score"] for c in line) / len(line)
-            observations.append(OcrObservation(time_ms, merged, avg_score))
+            crop = self._crop_roi(image, roi)
+            if crop is None:
+                observations.append(OcrObservation(time_ms, "", 0.0, error="empty_roi"))
+                continue
+
+            change = self._roi_change(prev_crop, crop)
+            prev_crop = crop
+            if change < self.config.change_threshold and last_text:
+                # 画面没变 → 字幕还在，沿用上一帧文本
+                observations.append(
+                    OcrObservation(time_ms, last_text, last_score, lines=last_lines)
+                )
+                continue
+
+            try:
+                lines = self._ocr_roi(crop, roi, frame_size=(image.shape[0], image.shape[1]))
+            except Exception as exc:  # noqa: BLE001
+                observations.append(
+                    OcrObservation(time_ms, "", 0.0, error=f"ocr_failed:{exc}")
+                )
+                continue
+
+            text, score, nlines = self._lines_to_text(lines)
+            if text:
+                last_text, last_score, last_lines = text, score, nlines
+            observations.append(OcrObservation(time_ms, text, score, lines=nlines))
+
         return observations
 
     # -- 合并 -----------------------------------------------------------
     def merge(self, observations: list[OcrObservation]) -> list[Segment]:
-        """把逐帧观察合并成字幕句：相似即同一句，记录首末出现时间。"""
+        """把逐帧观察合并成字幕句。
+
+        O1-2：不再因为"多帧相同"就删句——同一句字幕持续 1~10 秒是正常的。
+        只有**长期不变**（跨整段时长都不换字）且被判定为界面文字时才剔除。
+        """
         segments: list[Segment] = []
         current_text = ""
         current_start = 0
         current_end = 0
         current_score = 0.0
         current_count = 0
+        current_lines = 1
 
         def flush() -> None:
-            nonlocal current_text, current_start, current_end, current_score, current_count
-            # 至少连续出现 min_samples 帧才认作一句：
-            # 只出现一帧的多半是转场闪烁、水印或识别噪声。
+            nonlocal current_text, current_start, current_end, current_score
+            nonlocal current_count, current_lines
             if (
                 current_text
                 and current_count >= self.config.min_samples
@@ -542,6 +401,7 @@ class SubtitleOcr:
                     text=current_text,
                     source="hard_subtitle_ocr",
                     confidence=round(current_score, 4),
+                    flags=[f"lines={current_lines}"],
                 ))
             current_text = ""
             current_count = 0
@@ -552,9 +412,9 @@ class SubtitleOcr:
                 flush()
                 continue
             if current_text and similarity(current_text, text) >= self.config.similarity:
-                # 同一句：取更长的（更完整）那个文本，时间延长
                 if len(normalize_text(text)) > len(normalize_text(current_text)):
                     current_text = text
+                    current_lines = obs.lines
                 current_end = obs.time_ms + int(self.config.sample_interval * 1000)
                 current_score = max(current_score, obs.score)
                 current_count += 1
@@ -564,10 +424,136 @@ class SubtitleOcr:
                 current_start = obs.time_ms
                 current_end = obs.time_ms + int(self.config.sample_interval * 1000)
                 current_score = obs.score
+                current_lines = obs.lines
                 current_count = 1
 
         flush()
         return segments
+
+    def split_static_text(
+        self, segments: list[Segment], total_ms: int
+    ) -> tuple[list[Segment], list[dict[str, Any]]]:
+        """把"长期不变"的段落挑出来当作界面文字（O1-2 / O4）。
+
+        判据：同一句话的持续时长 ≥ ``static_min_duration_ms``，且它是唯一一句
+        （没别的句子替换它）——那是常驻的界面/水印，不是对白字幕。
+        """
+        dialogue: list[Segment] = []
+        on_screen: list[dict[str, Any]] = []
+        for seg in segments:
+            duration = seg.end_ms - seg.start_ms
+            only_one = len(segments) == 1
+            if duration >= self.config.static_min_duration_ms and only_one:
+                on_screen.append({
+                    "time_ms": seg.start_ms,
+                    "end_ms": seg.end_ms,
+                    "text": seg.text,
+                    "kind": "static_overlay",
+                })
+            else:
+                dialogue.append(seg)
+        return dialogue, on_screen
+
+    # -- 旧检测器（兜底） -------------------------------------------------
+    def detect_band(self, video: str | Path, work_dir: Path) -> Roi:
+        """旧版"最大字号动态文字带"检测，作为新跟踪器的兜底。"""
+        from .subtitle_region import SubtitleRegionTracker, TrackerConfig
+
+        tracker = SubtitleRegionTracker(
+            self._get_engine(), ffmpeg=self.ffmpeg,
+            config=TrackerConfig(
+                windows=self.config.region_windows,
+                window_seconds=self.config.region_window_seconds,
+                fps=self.config.region_fps,
+            ),
+        )
+        detection = tracker.track(video)
+        best = detection.best
+        if best is not None:
+            return Roi(best.x0, best.y0, best.x1, best.y1, method="temporal_tracking_v1")
+        return Roi(
+            self.config.band_top, self.config.band_top + 0.2,
+            1.0, self.config.band_bottom, method="fallback",
+        )
+
+    def detect_roi(
+        self, video: str | Path, work_dir: Path
+    ) -> tuple[Roi, dict[str, Any], Any]:
+        """确定本次使用的字幕 ROI。
+
+        返回 (ROI, 诊断信息, 区域检测结果)。
+        """
+        from .subtitle_region import SubtitleRegionTracker, TrackerConfig
+
+        fixed = self.config.fixed_band
+        if fixed is not None:
+            y0, y1 = fixed
+            return (
+                Roi(0.0, y0, 1.0, y1, method="fixed"),
+                {"method": "fixed", "regions": [], "warnings": []},
+                None,
+            )
+
+        tracker = SubtitleRegionTracker(
+            self._get_engine(), ffmpeg=self.ffmpeg,
+            config=TrackerConfig(
+                windows=self.config.region_windows,
+                window_seconds=self.config.region_window_seconds,
+                fps=self.config.region_fps,
+                min_score=self.config.region_min_score,
+            ),
+        )
+        detection = tracker.track(video)
+        info = detection.to_dict()
+        best = detection.best
+        if best is None:
+            roi = Roi(
+                self.config.band_top, self.config.band_top + 0.2,
+                1.0, self.config.band_bottom, method="fallback",
+            )
+            info.setdefault("warnings", []).append(
+                "字幕区跟踪未给出高置信结果，已回退到默认底部区域"
+            )
+            return roi, info, detection
+        return (
+            Roi(best.x0, best.y0, best.x1, best.y1, method=best.role),
+            info,
+            detection,
+        )
+
+    def _collect_on_screen_text(
+        self, detection: Any, roi: Roi
+    ) -> list[dict[str, Any]]:
+        """O4：收集字幕区**之外**的界面文字（按钮、菜单、文件名、标题栏）。
+
+        这些不是讲者的话，不能混进对白 transcript；单独作为一条证据通道。
+        """
+        if detection is None:
+            return []
+        out: list[dict[str, Any]] = []
+        for track in getattr(detection, "tracks", []) or []:
+            x0, y0, x1, y1 = track.rect()
+            # 与字幕区有重叠 → 属于对白通道，不重复
+            overlaps = not (
+                x1 < roi.x0 - 0.02 or x0 > roi.x1 + 0.02
+                or y1 < roi.y0 - 0.02 or y0 > roi.y1 + 0.02
+            )
+            if overlaps:
+                continue
+            texts = track.text_sequence()
+            if not texts:
+                continue
+            out.append({
+                "time_ms": track.start_ms,
+                "end_ms": track.end_ms,
+                "text": texts[0] if len(texts) == 1 else " / ".join(texts[:3]),
+                "kind": "ui_text",
+                "bbox": [round(x0, 4), round(y0, 4), round(x1, 4), round(y1, 4)],
+            })
+        # 按时长优先（出现越久的界面文字越有参考价值），并限制条数
+        out.sort(key=lambda t: -(t["end_ms"] - t["time_ms"]))
+        cap = max(1, self.config.max_on_screen_text)
+        return out[:cap]
 
     # -- 主流程 ---------------------------------------------------------
     def run(self, video: str | Path, duration_ms: int | None = None) -> OcrResult:
@@ -579,53 +565,51 @@ class SubtitleOcr:
 
         with tempfile.TemporaryDirectory(prefix="bili-ocr-") as tmp:
             work = Path(tmp)
-            # 1) 决定用哪个字幕区：配置固定 or 自动检测
-            fixed = self.config.fixed_band
-            if fixed is not None:
-                band = fixed
-                detection = BandDetection(
-                    top=fixed[0], bottom=fixed[1], confidence=1.0,
-                    method="fixed",
-                )
-            else:
-                detection = self.detect_band(video, work)
-                band = (detection.top, detection.bottom)
-                if detection.method == "fallback":
-                    result.warnings.append(
-                        "未能自动定位字幕区（画面里没有检测到会变化的文字），"
-                        f"已回退到默认区域 {band[0]:.0%}~{band[1]:.0%}"
-                    )
-
-            # 2) 主识别
+            roi, region_info, detection = self.detect_roi(video, work)
             try:
-                observations = self.observe(video, work, band)
+                observations = self.observe(video, work, roi)
             except Exception as exc:  # noqa: BLE001
                 result.warnings.append(f"OCR 抽帧/识别失败：{exc}")
                 return result
 
         segments = self.merge(observations)
-        result.segments = segments
+        dialogue, on_screen = self.split_static_text(segments, duration_ms or 0)
+        # O4：字幕区之外的界面文字也走独立通道
+        on_screen.extend(self._collect_on_screen_text(detection, roi))
+        result.segments = dialogue
+        result.on_screen_text = on_screen
 
+        errors = [o for o in observations if o.error]
         non_empty = [o for o in observations if o.text]
         result.stats = {
             "sampled_frames": len(observations),
             "frames_with_text": len(non_empty),
-            "segments": len(segments),
+            "frame_errors": len(errors),
+            "segments": len(dialogue),
             "sample_interval_s": self.config.sample_interval,
-            "band": [round(band[0], 4), round(band[1], 4)],
-            "band_detection": detection.to_dict(),
+            "roi": {
+                "x0": round(roi.x0, 4), "y0": round(roi.y0, 4),
+                "x1": round(roi.x1, 4), "y1": round(roi.y1, 4),
+                "method": roi.method,
+            },
+            "region_detection": region_info,
+            "on_screen_text": len(on_screen),
+            "time_precision": "sample_interval",
         }
         if duration_ms:
             from .subtitle_normalize import coverage_stats
 
-            cov = coverage_stats(segments, duration_ms)
+            cov = coverage_stats(dialogue, duration_ms)
             result.stats["coverage_ratio"] = cov["segment_time_coverage"]
             result.stats["segment_time_coverage"] = cov["segment_time_coverage"]
             result.stats["covered_ms"] = cov["covered_ms"]
             result.stats["span_ratio"] = cov["span_ratio"]
-        if not segments:
+        if errors:
             result.warnings.append(
-                f"在字幕区 {band[0]:.0%}~{band[1]:.0%} 里没有识别到连续文字"
-                "（可能该视频没有烧录字幕，或字幕在别的位置）"
+                f"有 {len(errors)} 帧读取或识别失败（已与'没有字幕'区分记录）"
+            )
+        if not dialogue:
+            result.warnings.append(
+                f"在字幕区 {roi.y0:.0%}~{roi.y1:.0%} 里没有识别到连续对白"
             )
         return result

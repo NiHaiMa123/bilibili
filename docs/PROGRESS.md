@@ -367,6 +367,130 @@ MCP 工具需要客户端**重载会话**才会注入工具列表，本会话内
 
 ---
 
+## REVIEW_FIX_OCR 执行结果
+
+> 依据：`docs/REVIEW_FIX_OCR.md`（评审基线 4da33da）。本节逐项记录**已修复 / 暂缓 / 无法复现**，
+> 并给出测试命令与真实产物路径（脱敏）。
+
+### S0：优先修复影响工作流的 Bug
+
+| 项 | 状态 | 做法 | 回归测试 |
+| --- | --- | --- | --- |
+| S0-1 MCP `wait=false` 实际同步阻塞 | ✅ 已修复 | 新增 `src/bilibili_agent/jobs.py`（共享 JobManager）：CLI `--async` 与 MCP `wait=false` 共用同一任务协议与状态目录；状态文件 `os.replace` 原子写；worker 进程死掉时 `status()` 判 failed；`--refresh`/`--max-images` 透传给 worker | `tests/test_jobs.py`（T01/T02/T03，14 项） |
+| S0-2 字幕源选择语义错误 | ✅ 已修复 | 拆成 platform/soft/ocr/asr 四个独立方法 + 显式调度表：asr 不跑 OCR、ocr 失败不回落 ASR、platform 不下载媒体 | `tests/test_routing.py`（T04/T05/T06） |
+| S0-3 b23.tv 短链提前调用空参 view | ✅ 已修复 | 删除占位请求；按 scheme+host 判定短链（不用字符串包含）；每一跳目标都校验；限定 5 跳 | `tests/test_security.py`（T07） |
+| S0-4 图文/assets 失败仍被当完成 | ✅ 已修复 | 按模式定义必需产物：assets 不依赖字幕即可出图；illustrated 必须有 article.md + ≥1 张可读图片；manifest 记录 `status` 与 `missing_artifacts` | `tests/test_routing.py`（T08/T09）、`tests/test_cache_components.py`（T24） |
+| S0-5 未配置 BDL 时异常类型错误 | ✅ 已修复 | `BdlError(error_code=None)` → `code=None` | `tests/test_security.py`（T10） |
+
+### S1：正确性、安全边界与结果可用性
+
+| 项 | 状态 | 做法 | 回归测试 |
+| --- | --- | --- | --- |
+| S1-1 字幕 URL 校验与鉴权头 | ✅ 已修复 | 域名改为 `host==suffix or host.endswith("."+suffix)` 且强制 https；取字幕正文**不再附带账号 Cookie**；跳转逐跳校验 | `tests/test_security.py`（T11，含 evilhdslb.com / hdslb.com.attacker.example / http / 非官方重定向） |
+| S1-2 OCR 固定顶部区域上下界颠倒 | ✅ 已修复 | top 模式改用独立 `top_band_top/top_band_bottom`，并强制 `0<=y0<y1<=1`，非法区间直接抛错 | `tests/test_ocr.py`（T12） |
+| S1-3 `?p=2` 未驱动分 P 选择 | ✅ 已修复 | URL 的 `?p=N` 在未显式传 parts 时决定分 P；显式 `--parts` 优先 | `tests/test_routing.py`（T13） |
+| S1-4 缓存键缺参数 / 模式升级未复用 | ✅ 已修复 | 缓存按组件记账（transcript / frames 各自摘要），subtitle→illustrated 只重跑抽帧、字幕从已有 SRT 重建；manifest 原子写 | `tests/test_cache_components.py`（T14） |
+| S1-5 覆盖率用首尾跨度 | ✅ 已修复 | 新增 `segment_time_coverage`（时间并集 / 时长）与 `span_ratio`（首尾跨度，另名不冒充覆盖率） | `tests/test_subtitles.py`（T15） |
+| S1-6 MCP 章节索引字段缺失 | ✅ 已修复 | Pipeline 的分 P 结果带 `chapters`，manifest 同步写入；MCP `materialize`/`read_transcript` 可按章节范围读取 | `tests/test_cache_components.py`（T16） |
+| S1-7 关键帧偏向开头 | ✅ 已修复 | 抽帧改为**按时间分桶**（8 桶），每桶保底配额，再按质量分补齐；`min_gap` 与已选帧比较；输出按时间排序 | `tests/test_frames.py`（T17：前段 100 个场景变化 + 后段 2 个关键操作 → 后段仍有图） |
+| S1-8 搜索 limit=50 只查一页 | ✅ 已修复 | limit>20 按需分页、去重、限制总请求数（默认 5），遇风控直接抛出不重试 | `tests/test_search.py`（T18） |
+| S1-9 ASR 默认只按中文识别 | ✅ 已修复 | 默认 `language=auto` → 底层传 Python `None`（自动识别）；已核对 qwen_asr 的 `validate_language` 会拒绝字符串 `"None"` | `tests/test_asr_language.py`（T19） |
+| S1-10 文字型成功与错误输出一致性 | ✅ 已修复 | 多 P 部分失败聚合为 `partial`，顶层带分 P 级错误；错误阶段区分 `subtitle` / `frames` / `materialize` | `tests/test_routing.py`（T24） |
+
+### O1~O4：OCR 字幕区改造
+
+| 项 | 状态 | 做法 |
+| --- | --- | --- |
+| O1-1 时序字幕区跟踪 | ✅ 已实现 | 新增 `src/bilibili_agent/subtitle_region.py`：按时间分层取 6 个窗口（各 6s、3fps），整帧 OCR 后用空间重合+行高+位置稳定性关联成 region track，聚合成**四维 ROI**（x0,y0,x1,y1）；打分用可解释特征（底部软先验、水平居中、字高、样式稳定、内容按句替换、跨窗口持续出现；永久 UI 文字与瞬时弹窗为负向特征）；返回 `heuristic_score` + `evidence`，低分时回退旧检测器 |
+| O1-2 静态界面文字与真字幕的时序判定 | ✅ 已实现 | 不再按"整片 15% 频率"删句：改用**变化触发式识别**（ROI 像素几乎不变就跳过 OCR、沿用上一帧文本），于是"同一句保持 1~10 秒"被完整保留；长期不变的唯一一段转入 on_screen_text |
+| O1-3 多行字幕与横向范围 | ✅ 已实现 | ROI 按四维裁剪（含横向 x0/x1），ROI 内文字按 y 聚成行、按 x 排序，支持 1~3 行，行间保留换行；可同时给出双语第二行区域 |
+| O2 触发式识别与时间边界细化 | ⚠️ 部分实现 | 已实现"轻量变化检测 + 双速率"的主干：ROI 内 32×18 灰度差分判变化，未变化则跳过 OCR；**转场时间二分细化尚未实现**，因此 manifest 里 `time_precision` 明确标为 `sample_interval`（采样间隔级），不伪装毫秒精准 |
+| O3 OCR 与 ASR 协作 | ✅ 已实现 | 有平台字幕时不跑 OCR/ASR；auto 模式下 OCR 覆盖不足时用 ASR **补缺口**（按时间并集去重合并，每段保留自己的 source）；ASR 与 OCR 文本冲突时保留双方原始证据并标记 conflict；完整性判定改用 `segment_time_coverage` + 采样密度双指标，不再用单一 10% 阈值 |
+| O4 字幕文字与画面文字分通道 | ✅ 已实现 | 对白进 `transcript.srt/md`；界面文字（常驻标题栏、水印、菜单）进 `manifest.extra.visual_text`（带 time_ms 与 kind） |
+
+### 本轮真实 E2E 记录（Windows 本机）
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q          # 183 passed
+uvx ruff check src tests --select F,E9,W,I,UP,B,RET,C4 --line-length 100
+.venv\Scripts\bili.exe doctor --json
+.venv\Scripts\bili.exe fetch BV18gDFBVEQF --parts 1 --mode subtitle --subtitle-source platform --refresh --json
+.venv\Scripts\bili.exe fetch BV1FW41157y3 --parts 1 --mode subtitle --subtitle-source ocr --refresh --json
+.venv\Scripts\bili.exe fetch BV1FW41157y3 --parts 1 --mode illustrated --subtitle-source auto --refresh --json
+```
+
+**样本 1：平台字幕路线（`BV18gDFBVEQF`）**
+
+```
+subtitle_source = platform_subtitle   status = completed
+segments = 63                          耗时 2.5s
+```
+✅ 未下载任何视频（纯字幕路线不碰媒体），符合 O3-1。
+
+**样本 2：烧录字幕 OCR 路线（`BV1FW41157y3`，画面底部有 gg 中文字幕）**
+
+```
+subtitle_source = hard_subtitle_ocr    status = completed
+segments = 106
+segment_time_coverage = 0.8651   span_ratio = 0.9983   chars = 1839
+耗时 118.6s
+region method = temporal_tracking_v1
+  采样帧 108   整帧 OCR 调用 108
+  主字幕区 ROI = x0 0.1491  y0 0.8250  x1 0.8486  y1 0.9042
+                heuristic_score 0.8185
+                evidence = [bottom_soft_prior, horizontally_centered,
+                            large_text, line_style_stable, text_turnover]
+  第二行区域 ROI = y 0.6979~0.7250（role=secondary_language_subtitle, score 0.7035）
+visual_text（界面文字独立通道）= 50 条（原始采集 373 条，按出现时长取前 50）
+```
+
+识别结果抽样（与原视频核对无误）：
+
+```
+[00:30–00:40] 很明显，这文件夹现在是空的（mdzz）
+[02:43–03:15] 这个裙子的贴图什么的（不选裙子pmx，"其他什
+[05:53–06:30] 我选中这些穿模了的身体✨
+[06:39–06:42] 所以我打算用ctrl+P把内裤也删了
+[08:54–09:24] 可能用到的是不同花纹的裙子贴图
+[09:27–09:38] 撒花结束 ！ ！ 上！）
+```
+
+✅ 四维 ROI 精确落在字幕带（y 0.825~0.904），横向 x 0.149~0.849 排除了左右两侧
+界面文字；对话文字与界面文字分成两条通道，互不污染。
+
+**样本 3：图文模式（`BV1FW41157y3`，`--mode illustrated --subtitle-source auto`）**
+
+```
+status = completed   mode = illustrated
+subtitle_source = platform_subtitle   segments = 278   frames = 13
+files = [transcript.srt, transcript.md, article.md]
+```
+✅ 这一轮 auto 路由先命中了平台字幕（AI 字幕），于是**没有跑 OCR、也没有跑 ASR**，
+只补了抽帧——正是 O3-1 要求的行为。同一视频显式 `--subtitle-source ocr` 时
+才会走烧录字幕 OCR（上面样本 2）。这也说明 B 站字幕接口的可用性本身会波动
+（同一视频有时给人工轨、有时只给 AI 轨），因此产物里始终标注实际来源。
+
+### 本轮实测踩坑（都是真跑出来的）
+
+1. **OCR 引擎返回像素坐标，跟踪器按相对坐标用** → ROI 算成 `36.0~47.0`（应为 `0.82`），
+   578 帧全部裁剪失败。修法：`OcrEngine.boxes()` 统一输出归一化坐标（0~1）。
+2. **`_roi_change` 里 `cv.INTER_AREA` 拼写错误**（应为 `cv2.`）→ 变化检测直接抛异常。
+3. **失败时"必需产物缺失"后面是空列表** → 提示没有信息量。改为分别提示"缺哪些产物"与"完全没产出内容"。
+4. **O4 通道未接上**：ROI 之外的界面文字没有单独收集，`visual_text` 为空。
+   修法：从区域跟踪的轨迹里取与 ROI 不重叠的那些，作为独立证据通道。
+5. **界面文字条数过多**：原始采集 373 条会让 manifest 涨到 106KB。
+   修法：按时长优先取前 50 条（`ocr.max_on_screen_text` 可调）。
+
+### 暂缓 / 未完成
+
+* **O2 的时间边界二分细化**未做：当前字幕起止时间精度等于采样间隔（1s），
+  manifest 里 `time_precision="sample_interval"`，文档与产物都不宣称毫秒级精准。
+* **OCR→ASR 补缺口目前是"全片 ASR + 按时间去重"**（评审文档允许的最低可用版本），
+  尚未做到"只转写缺口区间"。
+* **`bili fetch --async` 的主动取消**仍未实现（本轮只做了状态真实化）。
+
+---
+
 ## 还没做完的事
 
 1. **字幕区自动检测还可以更准**：当前判据是"跨帧变化的文字带里字号最大的那条"，

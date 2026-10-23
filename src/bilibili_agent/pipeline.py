@@ -457,17 +457,42 @@ class Pipeline:
         if soft:
             return soft, "soft_subtitle", None, None
 
+        ocr_segments: list[Segment] = []
+        ocr_stats: dict[str, Any] = {}
         if self.cfg.ocr_enabled and self.cfg.ocr_auto:
-            segs, stats = self._run_ocr(video, part, media_path, out_dir, warnings)
-            if segs:
-                return segs, "hard_subtitle_ocr", stats, None
+            ocr_segments, ocr_stats = self._run_ocr(
+                video, part, media_path, out_dir, warnings
+            )
+            duration_ms = (part.duration_s or 0) * 1000 or None
+            if ocr_segments and self._ocr_is_sufficient(
+                ocr_segments, duration_ms, ocr_stats
+            ):
+                return ocr_segments, "hard_subtitle_ocr", ocr_stats, None
+            if ocr_segments:
+                warnings.append(
+                    "烧录字幕" + str(ocr_stats.get("insufficient_reason", "覆盖不足"))
+                    + "，改用语音转写补缺口"
+                )
         else:
             warnings.append("OCR 已禁用（ocr.enabled/ocr.auto），跳过烧录字幕识别")
 
-        segs, meta = self._get_asr_subtitles(media_path, out_dir, warnings)
-        if segs:
-            return segs, "qwen3_asr", meta, None
-        return [], "none", meta, None
+        asr_segments, meta = self._get_asr_subtitles(media_path, out_dir, warnings)
+        if not asr_segments:
+            if ocr_segments:
+                # ASR 不可用，但 OCR 仍有内容 → 用 OCR 的结果，不算完全失败
+                return ocr_segments, "hard_subtitle_ocr", ocr_stats, None
+            return [], "none", meta, None
+
+        if not ocr_segments:
+            return asr_segments, "qwen3_asr", meta, None
+
+        # O3-4：OCR 缺口用 ASR 补齐，合并后每段保留自己的 source
+        merged, conflicts = self._merge_ocr_asr(ocr_segments, asr_segments)
+        stats = dict(ocr_stats)
+        stats["asr"] = meta
+        stats["ocr_asr_conflicts"] = conflicts
+        stats["merged_sources"] = sorted({s.source for s in merged})
+        return merged, "hard_subtitle_ocr+qwen3_asr", stats, None
 
     def _run_ocr(
         self,
@@ -476,8 +501,12 @@ class Pipeline:
         media_path: Path,
         out_dir: Path,
         warnings: list[str],
-    ) -> tuple[list[Segment], dict[str, Any] | None]:
-        """Level 3：跑烧录字幕 OCR。"""
+    ) -> tuple[list[Segment], dict[str, Any]]:
+        """Level 3：跑烧录字幕 OCR。
+
+        返回 (识别到的段, 统计)。**即使覆盖不足也返回识别到的段**，
+        由调用方决定是直接采用，还是用 ASR 补缺口（O3-4）。
+        """
         from .ocr_subtitles import OcrConfig, SubtitleOcr
 
         selector = SubtitleOcr(
@@ -496,23 +525,73 @@ class Pipeline:
         if problems:
             for p in problems:
                 warnings.append(p)
-            return [], None
+            return [], {}
 
         duration_ms = (part.duration_s or 0) * 1000 or None
         try:
             result = selector.run(media_path, duration_ms=duration_ms)
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"烧录字幕 OCR 失败：{exc}")
-            return [], None
+            return [], {}
 
         warnings.extend(result.warnings)
+        stats: dict[str, Any] = dict(result.stats)
+        stats["on_screen_text"] = result.on_screen_text
         if result.segments and not self._ocr_is_sufficient(
-            result.segments, (part.duration_s or 0) * 1000 or None, result.stats
+            result.segments, duration_ms, stats
         ):
-            reason = result.stats.pop("insufficient_reason", "覆盖不足")
-            warnings.append(f"烧录字幕{reason}，改用语音转写")
-            return [], result.stats
-        return result.segments, result.stats
+            stats["insufficient_reason"] = stats.get("insufficient_reason", "覆盖不足")
+        return result.segments, stats
+
+    @staticmethod
+    def _merge_ocr_asr(
+        ocr_segments: list[Segment], asr_segments: list[Segment]
+    ) -> tuple[list[Segment], list[dict[str, Any]]]:
+        """O3-4：OCR 缺口用 ASR 补齐，按时间去重合并。
+
+        * ASR 段落落在 OCR 已覆盖的区间内 → 不重复添加（保留画面原字）；
+        * 落在 OCR 缺口里的 → 追加，**保留自己的 source**；
+        * 同一时间范围内 ASR 与 OCR 文本差异很大 → 记一条冲突证据，
+          不擅自用 ASR 改写画面上的原字（字幕可能是翻译/意译）。
+        """
+        from .subtitle_normalize import merged_time_intervals
+
+        try:
+            from .ocr_subtitles import normalize_text, similarity
+        except ImportError:  # pragma: no cover
+            from .subtitle_normalize import similarity  # type: ignore[attr-defined]
+
+            def normalize_text(text: str) -> str:
+                import re
+
+                return re.sub(r"\s+", "", text or "")
+
+        covered = merged_time_intervals(ocr_segments)
+        conflicts: list[dict[str, Any]] = []
+        merged = list(ocr_segments)
+
+        for asr in asr_segments:
+            overlaps = any(
+                asr.start_ms < end and asr.end_ms > start for start, end in covered
+            )
+            if not overlaps:
+                merged.append(asr)
+                continue
+            for ocr in ocr_segments:
+                if asr.start_ms < ocr.end_ms and asr.end_ms > ocr.start_ms:
+                    a, b = normalize_text(asr.text), normalize_text(ocr.text)
+                    if a and b and a != b and similarity(a, b) < 0.5:
+                        conflicts.append({
+                            "start_ms": max(asr.start_ms, ocr.start_ms),
+                            "end_ms": min(asr.end_ms, ocr.end_ms),
+                            "ocr_text": ocr.text,
+                            "asr_text": asr.text,
+                            "note": "OCR 与 ASR 文本不一致，已同时保留原始证据",
+                        })
+                    break
+
+        merged.sort(key=lambda s: (s.start_ms, s.end_ms))
+        return merged, conflicts
 
     def _ocr_is_sufficient(
         self,
@@ -794,6 +873,8 @@ class Pipeline:
             warnings.append(
                 f"模式 {mode} 缺少必需产物：{', '.join(sorted(set(missing)))}"
             )
+        elif status == "failed":
+            warnings.append(f"模式 {mode} 没有产出任何内容（字幕与关键帧都为空）")
         # 错误阶段要能区分"字幕没拿到"和"抽帧没拿到"，别只报一句"没有可用的字幕内容"
         text_missing = any(m.startswith("transcript.") for m in missing)
         frame_missing = any(
@@ -822,9 +903,19 @@ class Pipeline:
             coverage=coverage,
             extra={
                 **({"subtitle_track": track_info} if track_info else {}),
-                **({"asr": extra_meta} if extra_meta else {}),
+                **({"asr": extra_meta.get("asr")} if extra_meta and extra_meta.get("asr") else {}),
                 **({"frames": [f.to_dict() for f in frames]} if frames else {}),
                 **({"chapters": [c.to_dict() for c in chapters]} if chapters else {}),
+                # O4：画面文字走独立通道，不混进对白 transcript
+                **({
+                    "visual_text": extra_meta.get("on_screen_text")
+                } if extra_meta and extra_meta.get("on_screen_text") else {}),
+                **({
+                    "ocr_region": extra_meta.get("region_detection")
+                } if extra_meta and extra_meta.get("region_detection") else {}),
+                **({
+                    "ocr_asr_conflicts": extra_meta.get("ocr_asr_conflicts")
+                } if extra_meta and extra_meta.get("ocr_asr_conflicts") else {}),
             },
         )
         payload = manifest.to_dict()
