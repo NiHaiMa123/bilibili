@@ -73,9 +73,13 @@ class Harness(Pipeline):
             self.behaviour.get("ocr_stats") or {},
         )
 
-    def _get_asr_subtitles(self, media_path, out_dir, warnings):
+    def _get_asr_subtitles(self, media_path, out_dir, warnings, *, wav_path=None):
         self.calls.append("asr")
         return self.behaviour.get("asr_segments") or [], self.behaviour.get("asr_meta")
+
+    def _speech_evidence(self, media_path, out_dir):
+        self.calls.append("vad")
+        return self.behaviour.get("speech") or [], None
 
     def _build_frames(self, video, part, segments, out_dir):
         self.calls.append("frames")

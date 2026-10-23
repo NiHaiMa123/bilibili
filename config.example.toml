@@ -78,6 +78,14 @@ sample_interval = 1.0
 # band=bottom 时使用的固定区域（相对画面高度）
 band_top = 0.74
 band_bottom = 0.99
+# band=top 时使用的固定区域（相对画面高度）
+top_band_top = 0.02
+top_band_bottom = 0.26
+# 区域跟踪：采样窗口数 / 每窗长度 / 窗内帧率 / 最低可信分
+region_windows = 6
+region_window_seconds = 6.0
+region_fps = 3.0
+region_min_score = 0.35
 # 文字框最低置信度
 min_score = 0.60
 # OCR 覆盖率低于该值时改走 ASR

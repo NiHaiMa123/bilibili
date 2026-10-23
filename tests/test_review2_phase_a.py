@@ -30,7 +30,8 @@ def test_fallback_roi_is_full_width_bottom(monkeypatch):
         "bilibili_agent.subtitle_region.SubtitleRegionTracker.track",
         lambda self, video, duration_ms=None: _NoBest(),
     )
-    roi, info, _ = ocr.detect_roi("fake.mp4", Path("."))
+    plan, info, _ = ocr.detect_roi("fake.mp4", Path("."))
+    roi = plan.fallback
     assert roi.x0 == 0.0
     assert roi.y0 == pytest.approx(0.74)
     assert roi.x1 == 1.0
@@ -57,7 +58,8 @@ def test_fallback_roi_honours_custom_band(monkeypatch):
         "bilibili_agent.subtitle_region.SubtitleRegionTracker.track",
         lambda self, video, duration_ms=None: _NoBest(),
     )
-    roi, _, _ = ocr.detect_roi("fake.mp4", Path("."))
+    plan, _, _ = ocr.detect_roi("fake.mp4", Path("."))
+    roi = plan.fallback
     assert (roi.x0, roi.y0, roi.x1, roi.y1) == (0.0, 0.55, 1.0, 0.80)
 
 

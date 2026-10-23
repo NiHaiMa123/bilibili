@@ -340,6 +340,8 @@ class Pipeline:
         media_path: Path,
         out_dir: Path,
         warnings: list[str],
+        *,
+        wav_path: Path | None = None,
     ) -> tuple[list[Segment], dict[str, Any] | None]:
         """Level 4：本地 Qwen3-ASR。"""
         adapter = ASRAdapter(
@@ -357,10 +359,10 @@ class Pipeline:
                 warnings.append(p)
             return [], None
 
-        wav_path = out_dir / "raw" / "audio_16k.wav"
+        wav = wav_path or (out_dir / "raw" / "audio_16k.wav")
         try:
             adapter.extract_wav(
-                media_path, wav_path, sample_rate=self.cfg.asr_sample_rate
+                media_path, wav, sample_rate=self.cfg.asr_sample_rate
             )
         except ASRError as exc:
             warnings.append(f"音频提取失败：{exc}")
@@ -430,6 +432,14 @@ class Pipeline:
             segs, stats = self._run_ocr(
                 video, part, Path(media_files[0]), out_dir, warnings
             )
+            if segs:
+                # 只 OCR 不 ASR（硬约束），但仍然给出完整性诊断
+                speech, _ = self._speech_evidence(
+                    Path(media_files[0]), out_dir
+                )
+                stats["completeness"] = self._assess_ocr_completeness(
+                    segs, (part.duration_s or 0) * 1000 or None, stats, speech
+                )
             if not segs:
                 warnings.append(
                     "按 --subtitle-source ocr 语义：烧录字幕 OCR 未产出可用文本，"
@@ -459,24 +469,30 @@ class Pipeline:
 
         ocr_segments: list[Segment] = []
         ocr_stats: dict[str, Any] = {}
+        speech: list[tuple[int, int]] = []
+        speech_wav: Path | None = None
         if self.cfg.ocr_enabled and self.cfg.ocr_auto:
             ocr_segments, ocr_stats = self._run_ocr(
                 video, part, media_path, out_dir, warnings
             )
             duration_ms = (part.duration_s or 0) * 1000 or None
-            if ocr_segments and self._ocr_is_sufficient(
-                ocr_segments, duration_ms, ocr_stats
-            ):
-                return ocr_segments, "hard_subtitle_ocr", ocr_stats, None
             if ocr_segments:
+                speech, speech_wav = self._speech_evidence(media_path, out_dir)
+                assessment = self._assess_ocr_completeness(
+                    ocr_segments, duration_ms, ocr_stats, speech
+                )
+                ocr_stats["completeness"] = assessment
+                if assessment["status"] == "complete":
+                    return ocr_segments, "hard_subtitle_ocr", ocr_stats, None
                 warnings.append(
-                    "烧录字幕" + str(ocr_stats.get("insufficient_reason", "覆盖不足"))
-                    + "，改用语音转写补缺口"
+                    "烧录字幕" + str(assessment["reason"]) + "，改用语音转写补缺口"
                 )
         else:
             warnings.append("OCR 已禁用（ocr.enabled/ocr.auto），跳过烧录字幕识别")
 
-        asr_segments, meta = self._get_asr_subtitles(media_path, out_dir, warnings)
+        asr_segments, meta = self._get_asr_subtitles(
+            media_path, out_dir, warnings, wav_path=speech_wav
+        )
         if not asr_segments:
             if ocr_segments:
                 # ASR 不可用，但 OCR 仍有内容 → 用 OCR 的结果，不算完全失败
@@ -538,6 +554,10 @@ class Pipeline:
                 top_band_bottom=self.cfg.ocr_top_band_bottom,
                 sample_interval=self.cfg.ocr_sample_interval,
                 min_score=self.cfg.ocr_min_score,
+                region_windows=self.cfg.ocr_region_windows,
+                region_window_seconds=self.cfg.ocr_region_window_seconds,
+                region_fps=self.cfg.ocr_region_fps,
+                region_min_score=self.cfg.ocr_region_min_score,
             ),
         )
         problems = selector.diagnose()
@@ -641,6 +661,144 @@ class Pipeline:
 
         merged.sort(key=lambda s: (s.start_ms, s.end_ms))
         return merged, conflicts
+
+    def _speech_evidence(
+        self, media_path: Path, out_dir: Path
+    ) -> tuple[list[tuple[int, int]], Path | None]:
+        """取语音活动区间（轻量能量 VAD），以及生成的 wav 路径。"""
+        from .audio_vad import speech_intervals_from_media
+
+        try:
+            return speech_intervals_from_media(
+                media_path, self.cfg.ffmpeg, out_dir / "raw"
+            )
+        except Exception:  # noqa: BLE001
+            return [], None
+
+    @staticmethod
+    def _longest_gap_ms(segments: list[Segment], duration_ms: int | None) -> int:
+        """整段视频里最长的"没有字幕"连续时长。"""
+        spans = sorted(
+            (s.start_ms, s.end_ms) for s in segments if s.end_ms > s.start_ms
+        )
+        merged: list[list[int]] = []
+        for start, end in spans:
+            if merged and start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        cursor = 0
+        longest = 0
+        for start, end in merged:
+            longest = max(longest, start - cursor)
+            cursor = max(cursor, end)
+        if duration_ms:
+            longest = max(longest, duration_ms - cursor)
+        return longest
+
+    @staticmethod
+    def _ocr_manifest_block(extra_meta: dict[str, Any] | None) -> dict[str, Any]:
+        """把 OCR 相关的诊断摘成一个块写进 manifest。
+
+        REVIEW2 §3.2 与 R2-06 都要求 manifest 里能直接看到：
+        完整性状态与依据、是否触发 fallback、采样帧数/OCR 调用数、
+        实际使用的 ROI 计划（而不只是最终那一个 rect）。
+        """
+        if not extra_meta:
+            return {}
+        keys = (
+            "completeness",      # R2-06：complete / incomplete / unknown + 依据
+            "fallback",          # §3.2：是否回退到全宽底部
+            "roi",               # §3.2：主 ROI
+            "roi_slots",         # R2-07：按时间选用的 ROI 计划
+            "sampled_frames",
+            "frames_with_text",
+            "frame_errors",
+            "time_precision",
+            "coverage_ratio",
+            "segment_time_coverage",
+            "covered_ms",
+            "span_ratio",
+            "merged_sources",
+            "merge_strategy",
+        )
+        out: dict[str, Any] = {}
+        for key in keys:
+            value = extra_meta.get(key)
+            if value is not None:
+                out[key] = value
+        # fallback 标记落在 region_detection 里，这里提上来一层方便检索
+        region = extra_meta.get("region_detection") or {}
+        if isinstance(region, dict):
+            if "fallback" not in out and "fallback" in region:
+                out["fallback"] = region["fallback"]
+            # §3.2：检测阶段的整帧 OCR 调用次数
+            if "ocr_calls" not in out and region.get("ocr_calls") is not None:
+                out["ocr_calls"] = region["ocr_calls"]
+        return out
+
+    def _assess_ocr_completeness(
+        self,
+        segments: list[Segment],
+        duration_ms: int | None,
+        stats: dict[str, Any],
+        speech: list[tuple[int, int]],
+    ) -> dict[str, Any]:
+        """区分"识别到一些字幕"（has_ocr_evidence）与"字幕完整"（is_transcript_complete）。
+
+        * 单一 10% 整片覆盖率**不能**当完整性依据；
+        * 有语音活动证据时，看字幕覆盖了多少**有声时段**、最长缺口多大；
+        * 没有语音活动证据时保守返回 ``unknown``，不冒充完整。
+        """
+        from .audio_vad import covered_ratio
+
+        metrics: dict[str, Any] = {
+            "has_ocr_evidence": bool(segments),
+            "segment_time_coverage": stats.get("segment_time_coverage"),
+            "frames_with_text": stats.get("frames_with_text"),
+            "sampled_frames": stats.get("sampled_frames"),
+            "longest_no_subtitle_ms": self._longest_gap_ms(segments, duration_ms),
+        }
+        if not segments:
+            return {
+                "status": "incomplete",
+                "reason": "没有识别到任何字幕",
+                "metrics": metrics,
+            }
+
+        if not speech:
+            return {
+                "status": "unknown",
+                "reason": "没有语音活动证据，无法确认字幕是否覆盖了全部语音",
+                "metrics": metrics,
+            }
+
+        ratio, longest_speech_gap = covered_ratio(
+            speech, [(s.start_ms, s.end_ms) for s in segments]
+        )
+        speech_total = sum(max(0, e - s) for s, e in speech)
+        metrics["speech_coverage"] = round(ratio, 4)
+        metrics["longest_speech_gap_ms"] = longest_speech_gap
+        metrics["speech_total_ms"] = speech_total
+
+        gap_limit = max(3000, int(speech_total * 0.1))
+        if ratio >= 0.8 and longest_speech_gap <= gap_limit:
+            return {
+                "status": "complete",
+                "reason": (
+                    f"字幕覆盖了 {ratio:.0%} 的有声时段"
+                    f"（最长缺口 {longest_speech_gap / 1000:.1f}s）"
+                ),
+                "metrics": metrics,
+            }
+        return {
+            "status": "incomplete",
+            "reason": (
+                f"有声时段只覆盖了 {ratio:.0%}"
+                f"（最长缺口 {longest_speech_gap / 1000:.1f}s）"
+            ),
+            "metrics": metrics,
+        }
 
     def _ocr_is_sufficient(
         self,
@@ -816,6 +974,10 @@ class Pipeline:
             ocr_band=self.cfg.ocr_band,
             ocr_sample_interval=self.cfg.ocr_sample_interval,
             ocr_min_score=self.cfg.ocr_min_score,
+            ocr_region_windows=self.cfg.ocr_region_windows,
+            ocr_region_window_seconds=self.cfg.ocr_region_window_seconds,
+            ocr_region_fps=self.cfg.ocr_region_fps,
+            ocr_region_min_score=self.cfg.ocr_region_min_score,
             asr_model=self.cfg.asr_model_path,
             asr_aligner=self.cfg.asr_aligner_path,
             asr_chunk=self.cfg.asr_max_chunk_seconds,
@@ -1024,6 +1186,7 @@ class Pipeline:
                 **({
                     "ocr_region": extra_meta.get("region_detection")
                 } if extra_meta and extra_meta.get("region_detection") else {}),
+                **({"ocr": self._ocr_manifest_block(extra_meta)} if self._ocr_manifest_block(extra_meta) else {}),
                 **({
                     "ocr_asr_conflicts": extra_meta.get("ocr_asr_conflicts")
                 } if extra_meta and extra_meta.get("ocr_asr_conflicts") else {}),

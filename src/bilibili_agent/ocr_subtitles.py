@@ -1,16 +1,22 @@
 """Level 3：画面烧录字幕 OCR。
 
-本轮（docs/REVIEW_FIX_OCR.md 的 O1~O4）把原来的"底部固定条 + 全文频率剔除"
+本轮（docs/REVIEW2.md 的 R2-01～R2-07）把"底部固定条 + 全文频率剔除"
 升级为：
 
-* **O1 时序字幕区跟踪**：用 ``subtitle_region.SubtitleRegionTracker`` 在多个
-  时间窗口上跟踪文字轨迹，得到**四维 ROI**（x0,y0,x1,y1）与可解释的 evidence。
-* **O1-2 时序判定**：不再按"整片 15% 频率"删句。变化触发式识别天然保留
-  "同一句字幕持续 1~10 秒"；跨窗口长期不变的文字判为界面静态文字，
-  转入 on_screen_text 通道。
-* **O1-3 多行字幕与横向范围**：ROI 内按行分组，支持 1~3 行；
+* **R2-01/R2-05 时序字幕区跟踪**：用 ``subtitle_region.SubtitleRegionTracker``
+  在多个时间窗口上跟踪文字轨迹（L1 窗口内 + L2 跨窗口归并），
+  得到**四维 ROI**（x0,y0,x1,y1）与可解释的 evidence；
+  字幕区按时间分段，片中位置变化也能跟上。
+* **R2-04 时序判定**：不再按"整片 15% 频率"删句。变化触发式识别天然保留
+  "同一句字幕持续 1~10 秒"；空白帧之后不会复活旧句；跨窗口长期不变的文字
+  判为界面静态文字，转入 on_screen_text 通道。
+* **R2-07 多行字幕与横向范围**：ROI 内按行分组，支持 1~3 行；
   裁剪按四维 ROI 进行，左右 UI 密集区不干扰。
-* **O2 触发式识别**：ROI 内像素几乎不变就跳过 OCR；文本转场时二分细化起止时间。
+* **O2 触发式识别**：ROI 内像素几乎不变就跳过 OCR（变化检测用"灰度均值差"
+  与"显著变化像素占比"取大者，小字出现/消失也能捕捉）。
+  **转场时间的二分/小步细化尚未实现**——字幕起止时间精度等于采样间隔
+  （默认 1 秒），manifest 里以 ``time_precision="sample_interval"`` 如实标注，
+  不宣称毫秒级精准。
 * **O3/O4 证据分离**：对白进 transcript，界面文字进 on_screen_text。
 """
 
@@ -147,6 +153,9 @@ class Roi:
     y1: float
     method: str = "auto"
     heuristic_score: float = 0.0
+    # 这一行文字的**典型字高**（相对画面高度）。ROI 内若混进了明显更小的
+    # 文字（软件教程里的文件列表、属性面板等），按它筛掉。
+    text_height: float = 0.0
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.x0 < self.x1 <= 1.0):
@@ -162,6 +171,87 @@ class Roi:
 
     def as_tuple(self) -> tuple[float, float, float, float]:
         return (self.x0, self.y0, self.x1, self.y1)
+
+    def key(self) -> tuple[float, ...]:
+        """几何指纹：用来标识"这是同一个 ROI"。
+
+        变化检测要按 ROI 而不是按下标记住上一帧的裁剪块——
+        字幕区随时间切换时，下标会错位。
+        """
+        return (
+            round(self.x0, 4), round(self.y0, 4),
+            round(self.x1, 4), round(self.y1, 4),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "x0": round(self.x0, 4), "y0": round(self.y0, 4),
+            "x1": round(self.x1, 4), "y1": round(self.y1, 4),
+            "method": self.method,
+            "heuristic_score": round(self.heuristic_score, 4),
+            "text_height": round(self.text_height, 4),
+        }
+
+    def overlaps(self, other: Roi, pad: float = 0.02) -> bool:
+        return not (
+            self.x1 < other.x0 - pad or self.x0 > other.x1 + pad
+            or self.y1 < other.y0 - pad or self.y0 > other.y1 + pad
+        )
+
+
+@dataclass(slots=True)
+class RoiSlot:
+    """一个时间段的字幕 ROI 集合（主 ROI + 可选第二字幕行）。"""
+
+    start_ms: int
+    end_ms: int
+    rois: list[Roi] = field(default_factory=list)
+
+
+class RoiPlan:
+    """按时间选用 ROI 的计划。
+
+    解决两件事：
+    * 视频中途把字幕从底部挪到顶部 → 分时段给出不同 ROI；
+    * 中英双语 → 同一时段给出两个 ROI，两行都能被识别。
+    """
+
+    def __init__(self, slots: list[RoiSlot], fallback: Roi) -> None:
+        self.slots = sorted(slots, key=lambda s: s.start_ms)
+        self.fallback = fallback
+
+    def rois_at(self, t_ms: int) -> list[Roi]:
+        """取该时刻适用的 ROI 列表（按 y 从上到下）。"""
+        for slot in self.slots:
+            if slot.start_ms <= t_ms <= slot.end_ms:
+                return list(slot.rois)
+        if not self.slots:
+            return [self.fallback]
+        # 不在任何 slot 内 → 取时间上最近的一个
+        best = min(
+            self.slots,
+            key=lambda s: min(abs(t_ms - s.start_ms), abs(t_ms - s.end_ms)),
+        )
+        return list(best.rois)
+
+    @property
+    def all_rois(self) -> list[Roi]:
+        out: list[Roi] = []
+        for slot in self.slots:
+            out.extend(slot.rois)
+        return out
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "slots": [
+                {
+                    "start_ms": s.start_ms,
+                    "end_ms": s.end_ms,
+                    "rois": [r.to_dict() for r in s.rois],
+                }
+                for s in self.slots
+            ],
+        }
 
 
 class SubtitleOcr:
@@ -282,6 +372,16 @@ class SubtitleOcr:
         if not items:
             return []
 
+        # T20：ROI 内若混进了**明显更小**的文字（软件教程里的文件列表、
+        # 属性面板等），按 ROI 自带的"典型字高"筛掉。
+        # 这类 UI 常常和字幕带**纵向重叠**（比如文件浏览器侧栏就在画面左下角），
+        # 只靠位置分不开，只能靠字高——实测字幕行 0.078，界面小字 0.023~0.027。
+        ref_h = roi.text_height or max(c["h"] for c in items)
+        min_h = ref_h * 0.5
+        items = [c for c in items if c["h"] >= min_h]
+        if not items:
+            return []
+
         # 按 y 聚成行
         items.sort(key=lambda c: c["cy"])
         lines: list[list[dict]] = []
@@ -301,11 +401,21 @@ class SubtitleOcr:
 
     @staticmethod
     def _lines_to_text(lines: list[list[Any]]) -> tuple[str, float, int]:
-        """把多行合成一段文本（行间保留换行）。"""
+        """把多行合成一段文本（行间保留换行）。
+
+        两个 ROI 区域有重叠时可能识别出**同一行**，
+        这里按文本去重，避免 transcript 里出现"句子\\n句子"。
+        """
         if not lines:
             return "", 0.0, 0
-        texts = ["".join(t for t, _ in ln).strip() for ln in lines]
-        texts = [t for t in texts if t]
+        texts: list[str] = []
+        seen: set[str] = set()
+        for ln in lines:
+            text = "".join(t for t, _ in ln).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            texts.append(text)
         if not texts:
             return "", 0.0, 0
         scores = [s for ln in lines for _, s in ln]
@@ -341,7 +451,7 @@ class SubtitleOcr:
         self,
         video: str | Path,
         work_dir: Path,
-        roi: Roi,
+        plan_or_roi,
     ) -> list[OcrObservation]:
         """抽帧 + ROI 内识别，得到逐帧观察结果。
 
@@ -353,7 +463,14 @@ class SubtitleOcr:
         * 识别到空白 → 立即清空缓存，**空白之后不能复活旧字幕**；
         * 引擎异常 / 读帧失败 → 记为 error，既不等于字幕消失，
           也不无条件沿用旧句（交给合并器按邻近证据判断）。
+
+        ``plan_or_roi`` 可以是 RoiPlan（按时间分段、支持双语双 ROI），
+        也可以是单个 Roi（兼容旧调用）。
         """
+        plan = (
+            plan_or_roi if isinstance(plan_or_roi, RoiPlan)
+            else RoiPlan([RoiSlot(0, 0, [plan_or_roi])], plan_or_roi)
+        )
         frames = self.extract_frames(video, work_dir)
         interval_ms = int(self.config.sample_interval * 1000)
         observations: list[OcrObservation] = []
@@ -361,7 +478,11 @@ class SubtitleOcr:
         last_score = 0.0
         last_lines = 0
         state = "init"  # init / text / blank / error
-        prev_crop = None
+        # 上一帧的裁剪块，**按 ROI 的几何**做键（不能用下标）：
+        # 字幕区会随时间切换（底部→顶部），下标会错位，
+        # 拿上一时段的裁剪块去和这一时段比较，可能因为"看起来差不多"
+        # 而误判成"画面没变"，把旧位置的字幕沿用到新位置。
+        prev_crops: dict[tuple[float, ...], Any] = {}
 
         for idx, frame in enumerate(frames):
             time_ms = idx * interval_ms
@@ -377,14 +498,25 @@ class SubtitleOcr:
                     OcrObservation(time_ms, "", 0.0, error="read_frame_failed")
                 )
                 continue
-            crop = self._crop_roi(image, roi)
-            if crop is None:
+
+            rois = plan.rois_at(time_ms)
+            roi_by_key = {roi.key(): roi for roi in rois}
+            crops: list[tuple[tuple[float, ...], Any]] = []
+            for roi in rois:
+                crop = self._crop_roi(image, roi)
+                if crop is not None:
+                    crops.append((roi.key(), crop))
+            if not crops:
                 state = "error"
                 observations.append(OcrObservation(time_ms, "", 0.0, error="empty_roi"))
                 continue
 
-            change = self._roi_change(prev_crop, crop)
-            prev_crop = crop
+            change = 0.0
+            for key, crop in crops:
+                prev = prev_crops.get(key)
+                change = max(change, self._roi_change(prev, crop))
+                prev_crops[key] = crop
+
             if state == "text" and change < self.config.change_threshold and last_text:
                 # 画面没变且上一帧确有字幕 → 沿用
                 observations.append(
@@ -392,12 +524,23 @@ class SubtitleOcr:
                 )
                 continue
 
-            try:
-                lines = self._ocr_roi(crop, roi, frame_size=(image.shape[0], image.shape[1]))
-            except Exception as exc:  # noqa: BLE001
+            lines: list[list[Any]] = []
+            failed = False
+            for key, crop in crops:
+                roi = roi_by_key.get(key) or rois[0]
+                try:
+                    part = self._ocr_roi(
+                        crop, roi, frame_size=(image.shape[0], image.shape[1])
+                    )
+                except Exception:  # noqa: BLE001
+                    failed = True
+                    break
+                lines.extend(part)
+
+            if failed:
                 state = "error"
                 observations.append(
-                    OcrObservation(time_ms, "", 0.0, error=f"ocr_failed:{exc}")
+                    OcrObservation(time_ms, "", 0.0, error="ocr_failed")
                 )
                 continue
 
@@ -540,24 +683,89 @@ class SubtitleOcr:
             heuristic_score=0.0,
         )
 
+    def _build_plan(
+        self, regions: list[Any], fallback: Roi, duration_ms: int | None
+    ) -> RoiPlan:
+        """把检测到的区域整理成"按时间选用"的 ROI 计划。
+
+        * 主字幕区 + 与它时间重叠的第二字幕行（双语）→ 同一时段，两个 ROI；
+        * 时间上不重叠的其它区域（片中位置变化）→ 各自成为独立时段。
+
+        主区域默认覆盖**全片**（它是兜底区域），其它区域只在自己的有效时段生效。
+        """
+        from .subtitle_region import ROLE_DIALOGUE, ROLE_SECONDARY
+
+        if not regions:
+            return RoiPlan(
+                [RoiSlot(0, duration_ms or 0, [fallback])],
+                fallback,
+            )
+
+        main = next((r for r in regions if r.role == ROLE_DIALOGUE), regions[0])
+        main_rois = [Roi(
+            x0=main.x0, y0=main.y0, x1=main.x1, y1=main.y1,
+            method=main.role, heuristic_score=main.heuristic_score,
+            text_height=getattr(main, "text_height", 0.0),
+        )]
+        for region in regions:
+            if region is main or region.role != ROLE_SECONDARY:
+                continue
+            if region.start_ms < main.end_ms and region.end_ms > main.start_ms:
+                main_rois.append(Roi(
+                    x0=region.x0, y0=region.y0, x1=region.x1, y1=region.y1,
+                    method=region.role, heuristic_score=region.heuristic_score,
+                    text_height=getattr(region, "text_height", 0.0),
+                ))
+        main_rois.sort(key=lambda r: r.y0)
+        # 主区域的时段就是**它自己的有效时段**，不是整片。
+        # 若主区域只在前半段有字幕（后半段字幕换到别处），
+        # 主区域若继续占着全片，后半段就永远读不到新位置的字幕。
+        main_start = int(main.start_ms)
+        main_end = int(main.end_ms)
+        if main_end <= main_start:
+            main_start, main_end = 0, int(duration_ms or 0)
+        if duration_ms:
+            main_end = min(main_end, int(duration_ms))
+        slots: list[RoiSlot] = [RoiSlot(main_start, max(main_end, main_start + 1),
+                                         main_rois)]
+
+        # 其它不重叠的区域 → 独立时段（片中位置变化）
+        for region in regions:
+            if region is main or region.role == ROLE_SECONDARY:
+                continue
+            slots.append(RoiSlot(
+                region.start_ms, region.end_ms,
+                [Roi(
+                    x0=region.x0, y0=region.y0, x1=region.x1, y1=region.y1,
+                    method=region.role, heuristic_score=region.heuristic_score,
+                    text_height=getattr(region, "text_height", 0.0),
+                )],
+            ))
+        return RoiPlan(slots, fallback)
+
     def detect_roi(
         self, video: str | Path, work_dir: Path
-    ) -> tuple[Roi, dict[str, Any], Any]:
-        """确定本次使用的字幕 ROI。
+    ) -> tuple[RoiPlan, dict[str, Any], Any]:
+        """确定本次使用的字幕 ROI 计划（按时间分段）。
 
-        返回 (ROI, 诊断信息, 区域检测结果)。
+        返回 (计划, 诊断信息, 区域检测结果)。
         """
         from .subtitle_region import SubtitleRegionTracker, TrackerConfig
 
         fixed = self.config.fixed_band
         if fixed is not None:
             y0, y1 = fixed
+            roi = Roi(
+                x0=0.0, y0=y0, x1=1.0, y1=y1,
+                method="fixed", heuristic_score=1.0,
+            )
             return (
-                Roi(
-                    x0=0.0, y0=y0, x1=1.0, y1=y1,
-                    method="fixed", heuristic_score=1.0,
-                ),
-                {"method": "fixed", "regions": [], "warnings": []},
+                RoiPlan([RoiSlot(0, 0, [roi])], roi),
+                {
+                    "method": "fixed", "regions": [], "warnings": [],
+                    # 显式记录"没有走兜底"，不要让 manifest 里靠"字段缺失"来推断
+                    "fallback": False,
+                },
                 None,
             )
 
@@ -584,16 +792,14 @@ class SubtitleOcr:
                 "x0": roi.x0, "y0": roi.y0, "x1": roi.x1, "y1": roi.y1,
                 "method": roi.method, "heuristic_score": roi.heuristic_score,
             }
-            return roi, info, detection
-        return (
-            Roi(
-                x0=best.x0, y0=best.y0, x1=best.x1, y1=best.y1,
-                method=best.role,
-                heuristic_score=best.heuristic_score,
-            ),
-            info,
-            detection,
+            return RoiPlan([RoiSlot(0, 0, [roi])], roi), info, detection
+
+        plan = self._build_plan(
+            detection.regions, self._fallback_roi(), detection.duration_ms or None
         )
+        info["fallback"] = False
+        info["roi_plan"] = plan.to_dict()
+        return plan, info, detection
 
     def _collect_on_screen_text(
         self, detection: Any, roi: Roi
@@ -601,18 +807,21 @@ class SubtitleOcr:
         """O4：收集字幕区**之外**的界面文字（按钮、菜单、文件名、标题栏）。
 
         这些不是讲者的话，不能混进对白 transcript；单独作为一条证据通道。
+        排除范围是**所有**已确认的字幕区域（不只是主 ROI），
+        否则双语第二行会被误归到界面通道。
         """
         if detection is None:
             return []
+        excluded: list[Roi] = [roi]
+        for region in getattr(detection, "regions", None) or []:
+            excluded.append(Roi(
+                x0=region.x0, y0=region.y0, x1=region.x1, y1=region.y1,
+                method=region.role,
+            ))
         out: list[dict[str, Any]] = []
         for track in getattr(detection, "tracks", []) or []:
             x0, y0, x1, y1 = track.rect()
-            # 与字幕区有重叠 → 属于对白通道，不重复
-            overlaps = not (
-                x1 < roi.x0 - 0.02 or x0 > roi.x1 + 0.02
-                or y1 < roi.y0 - 0.02 or y0 > roi.y1 + 0.02
-            )
-            if overlaps:
+            if any(Roi(x0=x0, y0=y0, x1=x1, y1=y1).overlaps(r) for r in excluded):
                 continue
             texts = track.text_sequence()
             if not texts:
@@ -639,9 +848,9 @@ class SubtitleOcr:
 
         with tempfile.TemporaryDirectory(prefix="bili-ocr-") as tmp:
             work = Path(tmp)
-            roi, region_info, detection = self.detect_roi(video, work)
+            plan, region_info, detection = self.detect_roi(video, work)
             try:
-                observations = self.observe(video, work, roi)
+                observations = self.observe(video, work, plan)
             except Exception as exc:  # noqa: BLE001
                 result.warnings.append(f"OCR 抽帧/识别失败：{exc}")
                 return result
@@ -649,12 +858,13 @@ class SubtitleOcr:
         segments = self.merge(observations)
         dialogue, on_screen = self.split_static_text(segments, duration_ms or 0)
         # O4：字幕区之外的界面文字也走独立通道
-        on_screen.extend(self._collect_on_screen_text(detection, roi))
+        on_screen.extend(self._collect_on_screen_text(detection, plan.fallback))
         result.segments = dialogue
         result.on_screen_text = on_screen
 
         errors = [o for o in observations if o.error]
         non_empty = [o for o in observations if o.text]
+        main_roi = plan.rois_at(0) or [plan.fallback]
         result.stats = {
             "sampled_frames": len(observations),
             "frames_with_text": len(non_empty),
@@ -662,10 +872,18 @@ class SubtitleOcr:
             "segments": len(dialogue),
             "sample_interval_s": self.config.sample_interval,
             "roi": {
-                "x0": round(roi.x0, 4), "y0": round(roi.y0, 4),
-                "x1": round(roi.x1, 4), "y1": round(roi.y1, 4),
-                "method": roi.method,
+                "x0": round(main_roi[0].x0, 4), "y0": round(main_roi[0].y0, 4),
+                "x1": round(main_roi[0].x1, 4), "y1": round(main_roi[0].y1, 4),
+                "method": main_roi[0].method,
+                "heuristic_score": round(main_roi[0].heuristic_score, 4),
             },
+            "roi_slots": [
+                {
+                    "start_ms": s.start_ms, "end_ms": s.end_ms,
+                    "rois": [r.to_dict() for r in s.rois],
+                }
+                for s in plan.slots
+            ],
             "region_detection": region_info,
             "on_screen_text": len(on_screen),
             "time_precision": "sample_interval",
@@ -683,7 +901,9 @@ class SubtitleOcr:
                 f"有 {len(errors)} 帧读取或识别失败（已与'没有字幕'区分记录）"
             )
         if not dialogue:
+            main_roi = main_roi or [plan.fallback]
             result.warnings.append(
-                f"在字幕区 {roi.y0:.0%}~{roi.y1:.0%} 里没有识别到连续对白"
+                f"在字幕区 {main_roi[0].y0:.0%}~{main_roi[0].y1:.0%} "
+                "里没有识别到连续对白"
             )
         return result

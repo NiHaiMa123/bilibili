@@ -491,6 +491,158 @@ files = [transcript.srt, transcript.md, article.md]
 
 ---
 
+## REVIEW2 执行结果
+
+> 依据：`docs/REVIEW2.md`（审查基线 `0f13d01`）。逐项写明完成/暂缓、测试命令与验证证据。
+> 本轮实测数量为**独立复测**结果（Phase A 后 202 passed，Phase B 后 227 passed），不沿用历史 `183 passed`。
+
+### Phase A：先修 Bug（P0 四项）
+
+| 项 | 状态 | 做法 | 回归测试 |
+| --- | --- | --- | --- |
+| R2-01 fallback ROI 的 x/y 写反 | ✅ 已修复 | `Roi` 构造顺序是 `(x0,y0,x1,y1)`，回退时按位置参数传成了 `(band_top, band_top+0.2, 1.0, band_bottom)`，实际只裁右下角一小块。改为**全宽底部** `Roi(x0=0.0, y0=band_top, x1=1.0, y1=band_bottom)`；所有 `Roi` 构造改关键字参数；`Roi.__post_init__` 严格校验 `0<=x0<x1<=1`、`0<=y0<y1<=1`；`detect_band()` 同款错误一并修；回退时 `method=fallback`、`heuristic_score=0` 并在诊断里写明 | T01（`test_review2_phase_a.py`） |
+| R2-02 关键帧组件未登记真实图片 | ✅ 已修复 | frames 组件改为登记真实 `Frame.relative_path`（`image_files`），不再从 `files` 反推；缓存命中要逐张核对图片存在且非空 + `frame_count` 与清单一致 + illustrated 额外要求 `article.md`；`manifest.files` 与 outputs 包含真实图片；缺图提示按配置后缀（jpg/png/webp） | T02/T03/T04/T05 |
+| R2-03 任意重叠即丢整条 ASR | ✅ 已修复 | 改为按**重叠比例**：完全覆盖且文本一致才去重；部分重叠或文本不一致时**保留 ASR 原文**并打 `overlap_with_ocr`；块级 ASR 不做按字符比例的伪切分；冲突记录含双方来源/时间/原因；整段 ASR 另存 `raw/alternate_evidence.json` | T06/T07/T08/T09 |
+| R2-04 空白帧复活旧字幕 | ✅ 已修复 | 引入 text/blank/error 三态：只有上一帧确实有字幕且画面近似未变才复用；识别到空白立即清空缓存；引擎异常记为 error，不当断句点也不无条件沿用。变化检测改为「灰度均值差」与「显著变化像素占比」取大者（64×36），小字出现/消失也能捕捉 | T10 |
+
+**Phase A 提交**：`6a5cab9`（已推送）。
+
+### Phase B：OCR 质量与泛化（P1 三项）
+
+| 项 | 状态 | 做法 | 回归测试 |
+| --- | --- | --- | --- |
+| R2-05 跨窗口证据无法生效 | ✅ 已修复 | 改成**两级轨迹**：L1 窗口内逐帧关联（保留短时间阈值），L2 按归一化行位置/字高/外框把不同窗口的 L1 轨迹归并成"区域候选"。归并判据是**相对行高**（纵向偏移 ≤ 行高×0.6），避免中英双行被误并。`persists_across_windows` 现在真的按区域跨窗口证据计分 | T11/T12/T13/T23 |
+| R2-06 10% 覆盖率即算完整 | ✅ 已修复 | 区分 `has_ocr_evidence` 与 `is_transcript_complete`：新增轻量**能量法 VAD**（`audio_vad.py`，100ms 帧 RMS）估计有声时段，再算字幕对**有声时段**的覆盖率与最长缺口；没有语音活动证据时保守返回 `unknown`，不冒充完整。`source=ocr` 仍不跑 ASR（硬约束），`auto` 按证据回退；manifest 写明状态/依据/指标 | T14/T15/T16/T21/T22 |
+| R2-07 只用 best 的全片 ROI | ✅ 已修复 | 引入 `RoiPlan`/`RoiSlot`：**按时间选用** ROI；主字幕区 + 时间重叠的第二字幕行（双语）→ 同一时段两个 ROI，两行都能识别；时间不重叠的其它区域（片中位置变化）→ 独立时段。区域外包络横向用 min/max（长句两端不被裁断）、纵向用 p02/p98。`visual_text` 排除**所有**已确认字幕区域，第二行不会落进界面通道 | T17/T18/T19/T20/T24/T25/T26/T27/T28 |
+
+**Phase B 提交**：`__PHASE_B_SHA__`（已推送）。
+
+### 本轮实测踩坑（Phase A/B 修掉的真 bug）
+
+1. **L2 归并形同虚设**：候选的 `rect` 在归并**之后**才算，导致比较时全是 `(0,0,0,0)`，
+   跨窗口一条都没并上；新候选创建后同样没算 rect。修复后 6 个窗口的同一条字幕带才归成一个候选。
+2. **中英双行被错误合并**：归并阈值用绝对值 0.10，而双语两行只差 0.07 → 被并成一条。
+   改为相对行高判据后，两行各自成为独立候选。
+3. **长句两端被裁**：外包络横向用 p02/p98，样本少时长句会被切一半。横向改用 min/max。
+4. **L2 归并拿"累积外包络"比字高**（Phase B 实测才发现）：外包络会随成员增加而变高，
+   越滚越大之后，后面窗口里**完全正常**的轨道会因为"字高比过大"被拒之门外——
+   同一条字幕带被切成两段，还凭空多出两个"位置变化"的区域。
+   改用**成员轨迹的中位字高 / 中位行中心**比较后，真实视频只剩 1 个字幕区。回归测试 T23。
+5. **主区域 slot 覆盖整片**："位置迁移"的区域虽然被检测出来，实际识别时仍永远命中主区域，
+   后半段字幕读不到（半片空白）。主区域 slot 改为**它自己的有效时段**。回归测试 T24。
+6. **"第二字幕行"判定太松**：只要求"基线不同"，于是远处一条界面文字带被当成双语第二行，
+   整屏 UI 被当成对白 OCR 进来——实测字符数从 3.4k 涨到 11.1k。
+   现在要求两行**紧挨着**（间距 ≤ 半行高）、**不是同一条带**（重叠 < 30%）、字高相近。
+   回归测试 T26/T27。
+7. **外包络高度区分不了"字幕行"和"界面元素"**：真正能区分的是**实际框的字高**——
+   实测同一个教程里字幕行中位字高 0.078，界面小字只有 0.023～0.027（差 3 倍）。
+   判据改成字高。回归测试 T27。
+8. **ROI 内的界面小字仍会混进对白**：软件教程里文件浏览器侧栏就在画面**左下角**，
+   与字幕带**纵向重叠**（y 0.798~0.94 vs 0.823~0.908），只看位置分不开。
+   改为按 ROI 自带的"典型字高"筛掉明显更小的文字。回归测试 T28。
+9. **重叠 ROI 识别出同一行** → transcript 里出现"句子\n句子"。改为同行去重。回归测试 T25。
+10. **变化检测按 ROI 下标记裁剪块**：字幕区随时间切换时下标会错位，
+    可能把旧位置的字幕沿用到新位置。改为按 ROI 几何做键。
+11. **Phase B 的测试往仓库根目录写 `f0/f1/f2.jpg`**：改到 `tmp_path`，不再污染工作区。
+
+### Windows 真实场景验证
+
+样本：`BV1FW41157y3`（PMX Editor 软件教程，烧录中文字幕）、`BV18gDFBVEQF`（平台字幕样本）。
+
+| 场景 | 命令 | 结果 |
+| --- | --- | --- |
+| 烧录字幕 OCR | `bili fetch BV1FW41157y3 --parts 1 --mode subtitle --subtitle-source ocr --refresh --json` | 见下方「Phase B 实测数据」 |
+| 平台字幕（不下载视频） | `bili fetch BV18gDFBVEQF --parts 1 --mode subtitle --subtitle-source platform --refresh --json` | `subtitle_source=platform_subtitle`，63 段，覆盖率 88.85%，**2.4s，未下载视频** |
+| 图文模式（auto） | `bili fetch BV1FW41157y3 --parts 1 --mode illustrated --subtitle-source auto --refresh --json` | 5.8s，产出 `article.md`（26KB）+ 8 张关键帧；`auto` 这次命中的是**平台字幕**（604 段），其跨度 1388140ms 远超视频时长 578000ms，代码按既有策略告警并取最先取到的一条 |
+| 图文模式（强制 OCR） | `bili fetch BV1FW41157y3 --parts 1 --mode illustrated --subtitle-source ocr --refresh --json` | 见下方「图文模式（OCR 路线）」 |
+
+### Phase B 实测数据（BV1FW41157y3，强制 OCR 路线）
+
+产物目录：`output/BV1FW41157y3/P01_36897122/`（`transcript.srt` / `transcript.md` / `manifest.json`）
+
+| 指标 | 数值 |
+| --- | --- |
+| 总耗时 | 约 230～280s（全片 578s，含检测期与识别期两阶段 OCR） |
+| 检测期整帧 OCR 调用 | 108 次（6 个采样窗口 × 6s × 3fps） |
+| 识别期采样帧 | 578 帧（1 秒一帧） |
+| 识别到字幕的帧 | 491 帧；读帧/识别异常 0 帧 |
+| 最终字幕区 | **1 个**（`dialogue_subtitle`，x 0.0296~0.9681 / y 0.8058~0.9233，score 0.9507） |
+| 字幕段数 | 95 段，其中 84 段含中文对白，11 段是单字符 UI 残留 |
+| `segment_time_coverage` | 0.782（452000ms / 578000ms） |
+| 最长无字幕缺口 | 13s |
+| 有声时段覆盖率（VAD） | 0.9072，最长有声缺口 3.7s |
+| 完整性判定 | `complete`（依据写入 `manifest.extra.ocr.completeness`） |
+| 界面文字通道 | 50 条（`manifest.extra.visual_text`） |
+| 真实字幕字数 | 1491 字 |
+
+> 说明：上一轮（Phase A 修完、未做本轮区域跟踪改造）同一视频是 106 段 / 覆盖率 0.8651，
+> 但其中混入了大量界面文字（"Mobile Uploads"、"select all"、"delete" 等），
+> **覆盖率被 UI 垃圾撑高了**。本轮把 UI 过滤掉后段数降到 95、字数降到 1491，
+> 留下的是基本干净的对白；覆盖率 0.782 是**去掉水分后的真实值**。
+
+### 合成样本（REVIEW2 §4 要求的双语 / 换位置 / 长短句）
+
+> ⚠️ **这三段是合成素材**（由 `tools/synthetic_samples.py` 用 PIL 渲染 + ffmpeg 编码生成，
+> **不是真实 B 站视频**）。仓库里没有现成的公开样本满足"双语 / 中途换位置 / 长短句交替"，
+> 按 REVIEW2 的许可生成合成片段，并在此明确标注。
+
+| 片段 | 时长 | 内容 | 实测结果 |
+| --- | --- | --- | --- |
+| `synthetic_bilingual.mp4` | 20s | 底部中英双行字幕，每 2.5s 一句 | 8 段，**每段同时含中文行与英文行**（`lines=2`），第二行没有落进 `visual_text` |
+| `synthetic_position_switch.mp4` | 24s | 前 12s 底部、后 12s 顶部 | 9 段：底部 5 段 + **顶部 4 段**（13s~23s），ROI 计划分两个时段 |
+| `synthetic_long_short.mp4` | 20s | 短句与 44 字长句交替 | 8 段，长句**完整 44 字**（开头"这是一个刻意…"、结尾"…结尾的字裁掉"都在），ROI 横向 x 0.0225~0.9775 未裁断 |
+
+复现：
+
+```powershell
+.venv\Scripts\python.exe tools\synthetic_samples.py make --out output\synthetic
+.venv\Scripts\python.exe tools\synthetic_samples.py run  --dir output\synthetic
+```
+
+（`output/synthetic/synthetic_report.json` 里有逐段文本、ROI 计划与断言结果。）
+
+### 图文模式（OCR 路线）
+
+`bili fetch BV1FW41157y3 --parts 1 --mode illustrated --subtitle-source ocr --refresh --json`
+
+| 指标 | 数值 |
+| --- | --- |
+| 状态 | `completed`，无 warning |
+| 字幕 | 95 段 / 覆盖率 0.782（与 subtitle 模式同一份 OCR 结果） |
+| 关键帧 | 16 张 `assets/*.jpg`，全部在 `manifest.files` 与 `components.frames.image_files` 中登记 |
+| `article.md` | 8.2KB，按场景切换 + 字幕锚点抽帧 |
+| 字幕区 | 1 个（与 subtitle 模式一致） |
+
+### 本轮测试
+
+```powershell
+cd E:\project\bilibili
+.venv\Scripts\python.exe -m pytest -q
+# → 227 passed
+uvx ruff check src tests tools --select F,E9,W,I,UP,B,RET,C4 --line-length 100
+# → All checks passed!
+```
+
+- Phase A 新增 `tests/test_review2_phase_a.py`（T01–T10）
+- Phase B 新增 `tests/test_review2_phase_b.py`（T11–T28）
+- 合成样本脚本：`tools/synthetic_samples.py`（`make` 生成、`run` 验证）
+
+### 仍有的限制
+
+1. **O2 的转场时间二分细化仍未做**：字幕起止时间精度 = 采样间隔（1s），
+   manifest 里 `time_precision="sample_interval"`，不宣称毫秒级精准。
+2. **OCR→ASR 补缺口目前是"全片 ASR + 按时间去重"**，尚未做到只转写缺口区间。
+3. **VAD 是能量法**，只能回答"这段时间有没有人在说话"，分不清音乐与人声；
+   有背景音乐的教程里 `speech_coverage` 会偏乐观。
+4. **"双语"识别只做到"两行都 OCR 出来"**，尚未按语言分字段（`lan`）分开保存。
+5. **UI 过滤靠的是"字高比"**，不是语义理解：极少数场景下，界面里的大号标题
+   和字幕字高相近，仍可能被当成对白。真实视频里剩余的 UI 痕迹集中在
+   画面左右边缘的侧栏。
+6. **区域跟踪只采样 6 个窗口**（每窗 6 秒），窗口之间的时间段靠中点插值推断；
+   短于采样间隔的"字幕突然换位置"事件可能捕捉不到。
+
+---
+
 ## 还没做完的事
 
 1. **字幕区自动检测还可以更准**：当前判据是"跨帧变化的文字带里字号最大的那条"，

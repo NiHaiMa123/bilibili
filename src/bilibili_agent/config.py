@@ -88,6 +88,11 @@ class Config:
     ocr_band_bottom: float = 0.99
     ocr_top_band_top: float = 0.02
     ocr_top_band_bottom: float = 0.26
+    # 区域跟踪（O1）
+    ocr_region_windows: int = 6
+    ocr_region_window_seconds: float = 6.0
+    ocr_region_fps: float = 3.0
+    ocr_region_min_score: float = 0.35
     ocr_min_score: float = 0.60
     ocr_min_coverage: float = 0.10
 
@@ -186,6 +191,14 @@ def load_config(explicit: str | os.PathLike[str] | None = None) -> Config:
     cfg.ocr_band_bottom = float(_get(data, "ocr", "band_bottom", default=0.99))
     cfg.ocr_top_band_top = float(_get(data, "ocr", "top_band_top", default=0.02))
     cfg.ocr_top_band_bottom = float(_get(data, "ocr", "top_band_bottom", default=0.26))
+    cfg.ocr_region_windows = int(_get(data, "ocr", "region_windows", default=6))
+    cfg.ocr_region_window_seconds = float(
+        _get(data, "ocr", "region_window_seconds", default=6.0)
+    )
+    cfg.ocr_region_fps = float(_get(data, "ocr", "region_fps", default=3.0))
+    cfg.ocr_region_min_score = float(
+        _get(data, "ocr", "region_min_score", default=0.35)
+    )
     cfg.ocr_min_score = float(_get(data, "ocr", "min_score", default=0.60))
     cfg.ocr_min_coverage = float(_get(data, "ocr", "min_coverage", default=0.10))
 

@@ -46,8 +46,11 @@ class TrackerConfig:
     max_height_ratio: float = 1.35  # 字高比例上限（判断是不是同一行）
     link_gap_ms: int = 1600  # 超过这个间隔就不认为是同一条轨迹（L1 窗口内）
     # L2 跨窗口归并
-    candidate_center_distance: float = 0.10  # 归并两个区域候选的最大行中心距
+    candidate_offset_ratio: float = 0.6  # 纵向偏移 ≤ 行高 × 该比例才算同一行
+    candidate_max_offset: float = 0.02  # 纵向偏移的绝对下限
+    candidate_height_ratio: float = 1.6  # 字高比上限（与候选成员的**中位字高**比）
     envelope_padding: float = 0.015  # 区域外包络的留白
+    max_timeline_regions: int = 2  # 最多额外输出几个"位置随时间变化"的区域
     min_score: float = 0.35  # 低于此分认为"没把握"，交给调用方 fallback
     static_text_ratio: float = 0.6  # 同一文字占比超过它且持续很久 → 判为界面静态文字
     static_min_duration_ms: int = 20_000  # 持续这么久才算"永久" UI
@@ -132,6 +135,10 @@ class SubtitleRegion:
     role: str = ROLE_DIALOGUE
     heuristic_score: float = 0.0
     evidence: list[str] = field(default_factory=list)
+    # 这一行文字的**典型字高**（相对画面高度）。
+    # 用来在 ROI 内区分"字幕"和"混进来的界面小字"——软件教程里
+    # 文件列表之类的 UI 常常和字幕带**纵向重叠**，只能靠字高分开。
+    text_height: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -144,6 +151,7 @@ class SubtitleRegion:
             "role": self.role,
             "heuristic_score": round(self.heuristic_score, 4),
             "evidence": self.evidence,
+            "text_height": round(self.text_height, 4),
         }
 
 
@@ -161,6 +169,7 @@ class RegionCandidate:
     heuristic_score: float = 0.0
     evidence: list[str] = field(default_factory=list)
     role: str = ROLE_DIALOGUE
+    active: tuple[int, int] = (0, 0)  # 该区域**有效的时间段**（按采样窗口插值）
 
     @property
     def windows(self) -> set[int]:
@@ -188,6 +197,43 @@ class RegionCandidate:
     def distinct_texts(self) -> int:
         return len({t for tr in self.tracks for t in tr.text_sequence()})
 
+    def median_height(self) -> float:
+        """成员轨迹的**中位字高**。
+
+        归并时不能用外包络高度做比较：外包络会随着成员增加而变高
+        （p02/p98 把最靠上的框和最靠下的框都算进去），
+        越滚越大之后，后来窗口里**完全正常**的轨道会因为"字高比过大"被拒之门外，
+        于是同一条字幕带被硬生生切成两段，还凭空多出一个"位置变化"的区域。
+        """
+        heights = [tr.height() for tr in self.tracks if tr.observations]
+        if not heights:
+            return 0.001
+        return max(statistics.median(heights), 0.001)
+
+    def median_center_y(self) -> float:
+        """成员轨迹的**中位行中心**（同样不用外包络，见 median_height）。"""
+        centers: list[float] = []
+        for tr in self.tracks:
+            if not tr.observations:
+                continue
+            _, y0, _, y1 = tr.rect()
+            centers.append((y0 + y1) / 2)
+        if not centers:
+            return 0.0
+        return statistics.median(centers)
+
+    def median_box_height(self) -> float:
+        """所有观测框的**中位字高**——真正的文字大小。
+
+        外包络高度会被"这一片区域里什么都有"撑大，区分不出
+        "一条字幕行"和"一堆小字界面元素"；只有实际框的字高能区分：
+        实测同一个教程里，字幕行中位字高 0.078，界面小字只有 0.023～0.027。
+        """
+        heights = [b.h for tr in self.tracks for _, b in tr.observations]
+        if not heights:
+            return 0.001
+        return max(statistics.median(heights), 0.001)
+
     def dominant_text_ratio(self) -> float:
         """整个候选里，同一文字占全部观测的比例（判断永久 UI 文字）。"""
         total = sum(len(tr.observations) for tr in self.tracks)
@@ -210,6 +256,9 @@ class RegionCandidate:
             "role": self.role,
             "heuristic_score": round(self.heuristic_score, 4),
             "evidence": self.evidence,
+            # 跨窗口证据的具体来源：出现在哪几个采样窗口、有几条成员轨迹
+            "windows": sorted(self.windows),
+            "tracks": len(self.tracks),
         }
 
 
@@ -222,6 +271,9 @@ class RegionDetection:
     candidates: list[RegionCandidate] = field(default_factory=list)
     sampled_frames: int = 0
     ocr_calls: int = 0
+    duration_ms: int = 0
+    # 写进 manifest 的候选条数上限（诊断用，保留分数最高的那些）
+    candidate_limit: int = 20
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -230,7 +282,9 @@ class RegionDetection:
             "warnings": list(self.warnings),
             "sampled_frames": self.sampled_frames,
             "ocr_calls": self.ocr_calls,
-            "candidates": [c.to_dict() for c in self.candidates],
+            "duration_ms": self.duration_ms,
+            "candidates": [c.to_dict() for c in self.candidates[: self.candidate_limit]],
+            "candidates_total": len(self.candidates),
         }
 
     @property
@@ -382,24 +436,42 @@ class SubtitleRegionTracker:
             h = max(y1 - y0, 0.001)
             placed = False
             for cand in candidates:
-                rx0, ry0, rx1, ry1 = cand.rect
-                rcy = (ry0 + ry1) / 2
-                rh = max(ry1 - ry0, 0.001)
-                if abs(cy - rcy) > self.config.candidate_center_distance:
+                # 与候选**成员轨迹**的典型几何比较，而不是与累积外包络比较
+                # （外包络会越滚越大，把后续窗口的正常轨道误判成"字高差太多"）
+                rcy = cand.median_center_y()
+                ref_h = cand.median_height()
+                # 只有**同一行**才归并：纵向偏移要小于行高的一定比例。
+                # （中英双行相距约 0.07，若用绝对阈值会被错误合并成一条。）
+                tol = max(
+                    self.config.candidate_max_offset,
+                    self.config.candidate_offset_ratio * ref_h,
+                )
+                if abs(cy - rcy) > tol:
                     continue
-                if h / rh > 1.5 or rh / h > 1.5:
+                ratio = self.config.candidate_height_ratio
+                if h / ref_h > ratio or ref_h / h > ratio:
                     continue
                 cand.tracks.append(track)
+                # 立即更新外包络，否则下一条轨迹比较时用的是 (0,0,0,0)
+                cand.rect = self._robust_envelope(cand.tracks)
                 placed = True
                 break
             if not placed:
-                candidates.append(RegionCandidate(tracks=[track]))
+                cand = RegionCandidate(tracks=[track])
+                # 新候选也要立刻算 rect，否则下一条轨迹比较时用的是 (0,0,0,0)
+                cand.rect = self._robust_envelope(cand.tracks)
+                candidates.append(cand)
         for cand in candidates:
             cand.rect = self._robust_envelope(cand.tracks)
         return candidates
 
     def _robust_envelope(self, tracks: list[RegionTrack]) -> tuple[float, float, float, float]:
-        """稳健外包络：用分位数而不是中位数，避免长短句交替时裁掉长句两端。"""
+        """稳健外包络。
+
+        * 横向用**实际观测到的最小/最大**（min/max）：长句的两端不能被裁掉，
+          用分位数会在样本少时把长句切一半；
+        * 纵向用分位数（p02/p98）：字幕带的上下边界要稳，不要被个别离群框拉偏。
+        """
         xs0: list[float] = []
         ys0: list[float] = []
         xs1: list[float] = []
@@ -420,9 +492,9 @@ class SubtitleRegionTracker:
 
         pad = self.config.envelope_padding
         return (
-            max(0.0, pct(xs0, 0.02) - pad),
+            max(0.0, min(xs0) - pad),
             max(0.0, pct(ys0, 0.02) - pad),
-            min(1.0, pct(xs1, 0.98) + pad),
+            min(1.0, max(xs1) + pad),
             min(1.0, pct(ys1, 0.98) + pad),
         )
 
@@ -486,6 +558,85 @@ class SubtitleRegionTracker:
 
         return max(0.0, min(1.0, score)), evidence
 
+    # -- 第二行 / 位置变化的判定 ------------------------------------------
+    @staticmethod
+    def _is_second_line(main: RegionCandidate, cand: RegionCandidate) -> bool:
+        """候选是不是主字幕行的"第二行"（双语字幕的第二行）。
+
+        要同时满足：
+        * 横向大致同一列；
+        * 纵向**紧挨着**主行（间距 ≤ 半行高），又**不是同一条带**（重叠很少）；
+        * 外包络高度与主行相当；
+        * **实际文字大小**与主行接近——界面小字和字幕大字差着好几倍，
+          这条是最有效的区分（实测字幕行中位字高 0.078，界面小字 0.023）。
+        """
+        x0, y0, x1, y1 = main.rect
+        tx0, ty0, tx1, ty1 = cand.rect
+        main_h = max(y1 - y0, 0.01)
+        sec_h = max(ty1 - ty0, 0.001)
+        if abs((tx0 + tx1) / 2 - (x0 + x1) / 2) >= 0.25:
+            return False
+        if abs((ty0 + ty1) / 2 - (y0 + y1) / 2) <= 0.04:
+            return False
+        gap = max(0.0, y0 - ty1, ty0 - y1)
+        if gap > 0.5 * main_h:
+            return False
+        overlap = max(0.0, min(y1, ty1) - max(y0, ty0))
+        if overlap >= 0.3 * min(main_h, sec_h):
+            return False
+        if not 0.5 <= sec_h / main_h <= 1.5:
+            return False
+        main_box = main.median_box_height()
+        sec_box = cand.median_box_height()
+        return 0.6 <= sec_box / main_box <= 1.4
+
+    @staticmethod
+    def _is_position_changed(main: RegionCandidate, cand: RegionCandidate) -> bool:
+        """候选是不是"字幕换了个位置"的新区域。
+
+        位置变了，但**字的大小不该变**——用它排除界面元素。
+        """
+        main_box = main.median_box_height()
+        sec_box = cand.median_box_height()
+        return 0.6 <= sec_box / main_box <= 1.4
+
+    def _active_range(
+        self,
+        cand: RegionCandidate,
+        window_spans: list[tuple[int, int, int]],
+        total_s: float,
+    ) -> tuple[int, int]:
+        """该区域"有效"的时间段。
+
+        采样窗口是稀疏的（6 个窗口铺满全片），不能直接把观测时刻当有效期，
+        否则路由时会把 10 秒处的帧配到"只在 0~6 秒出现"的区域上。
+        这里按**相邻窗口中点**做插值：区域出现在哪些窗口，就认为它在这段
+        窗口区间内有效。
+        """
+        if not window_spans:
+            return (0, int(total_s * 1000))
+        by_index = {w: (s, e) for w, s, e in window_spans}
+        windows = sorted(cand.windows)
+        if not windows:
+            return (0, int(total_s * 1000))
+        first = by_index.get(windows[0], window_spans[0][1:])
+        last = by_index.get(windows[-1], window_spans[-1][1:])
+        # 向前一个窗口的中点扩展
+        prev_w = windows[0] - 1
+        if prev_w in by_index:
+            prev_end = by_index[prev_w][1]
+            start = (prev_end + first[0]) // 2
+        else:
+            start = 0
+        # 向后一个窗口的中点扩展
+        next_w = windows[-1] + 1
+        if next_w in by_index:
+            next_start = by_index[next_w][0]
+            end = (last[1] + next_start) // 2
+        else:
+            end = int(total_s * 1000)
+        return (max(0, start), max(start + 1, end))
+
     # -- 主流程 ----------------------------------------------------------
     def track(self, video: str | Path, duration_ms: int | None = None) -> RegionDetection:
         detection = RegionDetection()
@@ -502,6 +653,7 @@ class SubtitleRegionTracker:
 
         cfg = self.config
         tracks: list[RegionTrack] = []
+        window_spans: list[tuple[int, int, int]] = []  # (窗口序号, 起止毫秒)
         with tempfile.TemporaryDirectory(prefix="bili-region-") as tmp:
             for w in range(cfg.windows):
                 # 窗口铺满整条时间轴，均匀分层
@@ -509,6 +661,11 @@ class SubtitleRegionTracker:
                 frames = self._window_frames(
                     video, start_s, cfg.window_seconds, Path(tmp) / f"win{w}"
                 )
+                window_spans.append((
+                    w,
+                    int(start_s * 1000),
+                    int((start_s + cfg.window_seconds) * 1000),
+                ))
                 for time_ms, path in frames:
                     image = self._read_image(path)
                     if image is None:
@@ -520,6 +677,7 @@ class SubtitleRegionTracker:
 
         detection.tracks = tracks
         detection.ocr_calls = self.engine.calls
+        detection.duration_ms = int(total_s * 1000)
 
         # L2：跨窗口归并成区域候选（这才让"跨窗口证据"真正生效）
         candidates = self._merge_candidates(tracks)
@@ -531,6 +689,7 @@ class SubtitleRegionTracker:
             score, evidence = self._score_candidate(cand)
             cand.heuristic_score = score
             cand.evidence = evidence
+            cand.active = self._active_range(cand, window_spans, total_s)
             scored.append((score, evidence, cand))
         scored.sort(key=lambda x: -x[0])
         detection.candidates = [c for _, _, c in scored]
@@ -550,50 +709,59 @@ class SubtitleRegionTracker:
         x0, y0, x1, y1 = top_cand.rect
         detection.regions.append(SubtitleRegion(
             x0=x0, y0=y0, x1=x1, y1=y1,
-            start_ms=top_cand.start_ms, end_ms=top_cand.end_ms,
+            start_ms=top_cand.active[0], end_ms=top_cand.active[1],
             role=ROLE_DIALOGUE,
             heuristic_score=top_score,
             evidence=top_evidence,
+            text_height=top_cand.median_box_height(),
         ))
 
-        # 第二字幕行（双语）：几何接近但基线不同、且内容也在变
+        # 第二字幕行（双语）：紧挨着主行、文字大小相近、时间上重叠
         for score, evidence, cand in scored[1:]:
-            if score < cfg.min_score * 0.8:
+            if score < cfg.min_score:
                 break
             tx0, ty0, tx1, ty1 = cand.rect
-            same_column = abs((tx0 + tx1) / 2 - (x0 + x1) / 2) < 0.25
-            different_line = abs((ty0 + ty1) / 2 - (y0 + y1) / 2) > 0.04
-            time_overlap = not (
-                cand.end_ms < top_cand.start_ms or cand.start_ms > top_cand.end_ms
+            time_overlap = (
+                cand.active[0] < top_cand.active[1]
+                and cand.active[1] > top_cand.active[0]
             )
-            if same_column and different_line and time_overlap:
+            if time_overlap and self._is_second_line(top_cand, cand):
                 detection.regions.append(SubtitleRegion(
                     x0=tx0, y0=ty0, x1=tx1, y1=ty1,
-                    start_ms=cand.start_ms, end_ms=cand.end_ms,
+                    start_ms=cand.active[0], end_ms=cand.active[1],
                     role=ROLE_SECONDARY,
                     heuristic_score=score,
                     evidence=evidence,
+                    text_height=cand.median_box_height(),
                 ))
                 break
 
-        # 位置随时间变化：同一"角色"但时间段不重叠的候选也要单独输出，
-        # 便于下游按时间段选用不同 ROI（而不是强行合成全片一个位置）。
+        # 位置随时间变化：只保留**分数接近主区域**的候选，且数量有限，
+        # 否则整屏 UI 碎片会变成一堆假区域，把 ROI 计划污染掉。
+        timeline_added = 0
         for score, evidence, cand in scored[1:]:
-            if score < cfg.min_score * 0.8:
+            if timeline_added >= cfg.max_timeline_regions:
+                break
+            if score < min(cfg.min_score, top_score * 0.9):
                 break
             tx0, ty0, tx1, ty1 = cand.rect
-            overlaps = not (
-                cand.end_ms < top_cand.start_ms or cand.start_ms > top_cand.end_ms
+            overlaps = (
+                cand.active[0] < top_cand.active[1]
+                and cand.active[1] > top_cand.active[0]
             )
             if overlaps:
                 continue
+            if not self._is_position_changed(top_cand, cand):
+                continue
             detection.regions.append(SubtitleRegion(
                 x0=tx0, y0=ty0, x1=tx1, y1=ty1,
-                start_ms=cand.start_ms, end_ms=cand.end_ms,
+                start_ms=cand.active[0], end_ms=cand.active[1],
                 role=ROLE_TIMELINE,
                 heuristic_score=score,
                 evidence=evidence,
+                text_height=cand.median_box_height(),
             ))
+            timeline_added += 1
 
         return detection
 
